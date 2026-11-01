@@ -18,19 +18,33 @@ Componentes comunicados mediante **sockets** (protocolo `<STX><DATA><ETX><LRC>`)
 
 ## Componentes
 
+La Central es un proyecto Maven (`CoreSystem/pom.xml`). Su código está en `CoreSystem/src/main/java/com/watermanagement/central/`, repartido en paquetes según su función:
+
+```
+central/
+├── WM_Central.java          arranque (main): BD, Kafka, panel web y servidor de sockets
+├── red/                     WM_Central_Thread: un hilo por cliente (tramas, ACK/NACK, timeout)
+├── logica/                  GestorRiegos: reglas de negocio (altas, riegos, averías, órdenes)
+├── datos/                   DatabaseManager: SQLite
+├── kafka/                   KafkaManager: productor de eventos
+└── panel/                   Dashboard (estado en memoria y log) y WebDashboard (servidor HTTP)
+```
+
+La web del panel está en `CoreSystem/src/main/resources/web/`.
+
 | Módulo | Fichero | Función |
 |---|---|---|
-| **WM_Central** | `CoreSystem/src/main/java/WM_Central.java` | Servidor de sockets (un hilo por cliente), lógica del sistema, BD SQLite, panel web y productor Kafka. |
-| GestorRiegos | `CoreSystem/.../GestorRiegos.java` | Lógica de negocio: altas, ciclo de riego, averías, órdenes de CENTRAL. |
-| WM_Central_Thread | `CoreSystem/.../WM_Central_Thread.java` | Atiende un socket: valida tramas (LRC), responde ACK/NACK, timeout de 15 s. |
-| DatabaseManager | `CoreSystem/.../DatabaseManager.java` | SQLite: tablas `watering_stations` y `operarios`. |
-| WebDashboard / Dashboard | `CoreSystem/.../WebDashboard.java`, `Dashboard.java` | Servidor HTTP del panel: ficheros estáticos, eventos en tiempo real (SSE, con latido cada 15 s) y API de órdenes y altas. |
+| **WM_Central** | `CoreSystem/src/main/java/com/watermanagement/central/WM_Central.java` | Servidor de sockets (un hilo por cliente), lógica del sistema, BD SQLite, panel web y productor Kafka. |
+| GestorRiegos | `central/logica/GestorRiegos.java` | Lógica de negocio: altas, ciclo de riego, averías, órdenes de CENTRAL. |
+| WM_Central_Thread | `central/red/WM_Central_Thread.java` | Atiende un socket: valida tramas (LRC), responde ACK/NACK, timeout de 15 s. |
+| DatabaseManager | `central/datos/DatabaseManager.java` | SQLite: tablas `watering_stations` y `operarios`. |
+| WebDashboard / Dashboard | `central/panel/WebDashboard.java`, `Dashboard.java` | Servidor HTTP del panel: ficheros estáticos, eventos en tiempo real (SSE, con latido cada 15 s) y API de órdenes y altas. |
 | Panel web | `CoreSystem/src/main/resources/web/` | `index.html` + `css/styles.css` + módulos JS: `store.js` (estado y SSE), `map.js` (mapa por zonas), `stations.js` (tabla y listas), `detail.js` (panel lateral de una WS), `control.js` (órdenes globales y altas), `events.js` (historial), `api.js`, `ui.js`, `app.js` (pestañas). |
-| KafkaManager | `CoreSystem/.../KafkaManager.java` | Publica los eventos en `wm-eventos` (clave = id de la WS). |
-| **WM_WS_M** | `Water_Station/WM_WS_M.java` | Monitor: se registra en CENTRAL, supervisa al Engine (HEALTH_CHECK cada segundo), autoriza riegos y controla su duración. |
-| **WM_WS_E** | `Water_Station/WM_WS_E.java` | Engine: electroválvula, caudalímetro simulado, detector de fugas (tecla K) y menú de la estación. |
-| **WM_FO** | `Water_Station/WM_FO.java` | Operario: pide riegos (manual o desde fichero, también en modo automático) y ve la telemetría de su WS. |
-| Protocolo | `Water_Station/Protocolo.java` | Tramas `<STX><DATA><ETX><LRC>` y ACK/NACK, común a Monitor, Engine y Operario. |
+| KafkaManager | `central/kafka/KafkaManager.java` | Publica los eventos en `wm-eventos` (clave = id de la WS). |
+| **WM_WS_M** | `Water_Station/src/WM_WS_M.java` | Monitor: se registra en CENTRAL, supervisa al Engine (HEALTH_CHECK cada segundo), autoriza riegos y controla su duración. |
+| **WM_WS_E** | `Water_Station/src/WM_WS_E.java` | Engine: electroválvula, caudalímetro simulado, detector de fugas (tecla K) y menú de la estación. |
+| **WM_FO** | `Water_Station/src/WM_FO.java` | Operario: pide riegos (manual o desde fichero, también en modo automático) y ve la telemetría de su WS. |
+| Protocolo | `Water_Station/src/Protocolo.java` | Tramas `<STX><DATA><ETX><LRC>` y ACK/NACK, común a Monitor, Engine y Operario. |
 
 ## Mecánica de un riego
 
@@ -112,19 +126,32 @@ docker attach engine-ws1    # menú de la estación (Ctrl+P, Ctrl+Q para salir)
 docker attach fo1           # menú del operario
 ```
 
-Sin Docker (Windows, solo requiere **Java 11+**, no se compila nada): los `.jar` ya generados (`WM_WS_M.jar`, `WM_WS_E.jar`, `WM_FO.jar`) se lanzan con los scripts, que preguntan el ID al arrancar y usan por defecto las direcciones de Railway:
+Estructura de `Water_Station/`:
 
-```bat
-Arrancar_Monitor.bat     :: ID de la WS, ubicación (Enter = la de CENTRAL), puerto local
-Arrancar_Engine.bat      :: ID de la WS y puerto de su Monitor
-Arrancar_Operario.bat    :: ID del operario y fichero de servicios (Enter = solo menú)
+```
+Water_Station/
+├── src/         código fuente (WM_WS_M, WM_WS_E, WM_FO, Protocolo)
+├── bin/         .jar ya compilados (WM_WS_M.jar, WM_WS_E.jar, WM_FO.jar)
+├── lib/         librerías (kafka-clients, slf4j-api)
+├── scripts/     Arrancar_Monitor.bat, Arrancar_Engine.bat, Arrancar_Operario.bat, compilar.bat
+├── servicios/   ficheros de servicios del operario (servicios_ejemplo.txt)
+├── Dockerfile   imagen de laboratorio
+└── compose.yml  despliegue de laboratorio con Docker
 ```
 
-También se pueden pasar como parámetros, p. ej. `Arrancar_Operario.bat iriguchi.proxy.rlwy.net:38689 FO_01 monorail.proxy.rlwy.net 32265 servicios_ejemplo.txt`, o directamente `java -jar WM_FO.jar <broker> FO_01 <host> <puerto> [fichero]`.
+Sin Docker (Windows, solo requiere **Java 11+**, no se compila nada): los `.jar` de `bin/` se lanzan con los scripts de `scripts/` (doble clic), que preguntan el ID al arrancar y usan por defecto las direcciones de Railway:
 
-**Modo automático (sin interacción)**: si el operario recibe un fichero de servicios, al conectarse los ejecuta uno tras otro (4 s entre servicios) y después muestra el menú. `compilar.bat` regenera los `.jar` (solo para desarrollo).
+```bat
+scripts\Arrancar_Monitor.bat     :: ID de la WS, ubicación (Enter = la de CENTRAL), puerto local
+scripts\Arrancar_Engine.bat      :: ID de la WS y puerto de su Monitor
+scripts\Arrancar_Operario.bat    :: ID del operario y fichero de servicios (Enter = solo menú)
+```
+
+También se pueden pasar como parámetros, p. ej. `scripts\Arrancar_Operario.bat iriguchi.proxy.rlwy.net:38689 FO_01 monorail.proxy.rlwy.net 32265 servicios_ejemplo.txt` (si solo se da el nombre del fichero, se busca en `servicios/`), o directamente desde `Water_Station`: `java -jar bin\WM_FO.jar <broker> FO_01 <host> <puerto> [fichero]`.
+
+**Modo automático (sin interacción)**: si el operario recibe un fichero de servicios, al conectarse los ejecuta uno tras otro (4 s entre servicios) y después muestra el menú. `scripts\compilar.bat` regenera los `.jar` de `bin/` a partir de `src/` (solo para desarrollo).
 
 ### Menús
 
 - **Engine** (`WM_WS_E`): `R [s]` riego manual · `F` finalizar riego · `K` simular fuga · `O` restablecer · `E` estado.
-- **Operario** (`WM_FO`): 1 riego puntual · 2 servicios desde fichero (`ID_WS[,segundos]`, ver `servicios_ejemplo.txt`) · 3 listar estaciones · 4 salir.
+- **Operario** (`WM_FO`): 1 riego puntual · 2 servicios desde fichero (`ID_WS[,segundos]`, ver `servicios/servicios_ejemplo.txt`) · 3 listar estaciones · 4 salir.

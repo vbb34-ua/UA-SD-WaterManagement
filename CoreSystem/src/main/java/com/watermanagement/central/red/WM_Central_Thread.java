@@ -1,3 +1,8 @@
+package com.watermanagement.central.red;
+
+import com.watermanagement.central.logica.GestorRiegos;
+import com.watermanagement.central.panel.Dashboard;
+
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.EOFException;

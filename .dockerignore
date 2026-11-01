@@ -18,8 +18,6 @@ CoreSystem/target/
 *.pdf
 README.md
 
-# JAR de dependencias copiados manualmente (Shade las descarga de Maven)
-CoreSystem/src/main/java/*.jar
 
 # WaterManagement (estaciones) - van en contenedores separados
 WaterManagement/

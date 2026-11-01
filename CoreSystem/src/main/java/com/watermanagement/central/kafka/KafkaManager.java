@@ -1,3 +1,7 @@
+package com.watermanagement.central.kafka;
+
+import com.watermanagement.central.panel.Dashboard;
+
 import java.util.Properties;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;

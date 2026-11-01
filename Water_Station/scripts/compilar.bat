@@ -1,8 +1,9 @@
 @echo off
 chcp 65001 > nul
-cd /d "%~dp0"
+REM Se trabaja desde la carpeta Water_Station (src\ -> bin\, usando lib\)
+cd /d "%~dp0.."
 REM ============================================================================
-REM  Genera WM_WS_M.jar, WM_WS_E.jar y WM_FO.jar a partir del código fuente.
+REM  Genera bin\WM_WS_M.jar, bin\WM_WS_E.jar y bin\WM_FO.jar a partir de src\.
 REM  SOLO para desarrollo: en la corrección se usan los .jar ya generados
 REM  (los Arrancar_*.bat no compilan nada). Requiere un JDK 11 o superior.
 REM ============================================================================
@@ -18,23 +19,24 @@ if exist build rmdir /s /q build
 mkdir build
 
 echo Compilando fuentes (Java 11)...
-javac --release 11 -encoding UTF-8 -cp "lib\*" -d build Protocolo.java WM_WS_M.java WM_WS_E.java WM_FO.java
+javac --release 11 -encoding UTF-8 -cp "lib\*" -d build src\Protocolo.java src\WM_WS_M.java src\WM_WS_E.java src\WM_FO.java
 if errorlevel 1 (
     echo Error de compilacion.
     pause
     exit /b 1
 )
 
-REM Manifest con las librerias de Kafka (ruta relativa al .jar)
-echo Class-Path: lib/kafka-clients-4.4.0.jar lib/slf4j-api.jar> manifest.tmp
+REM Manifest con las librerias de Kafka (ruta relativa al .jar: bin\ -> ..\lib\)
+echo Class-Path: ../lib/kafka-clients-4.4.0.jar ../lib/slf4j-api.jar> manifest.tmp
 
+if not exist bin mkdir bin
 for %%M in (WM_WS_M WM_WS_E WM_FO) do (
-    echo Generando %%M.jar...
-    jar --create --file %%M.jar --manifest manifest.tmp --main-class %%M -C build .
+    echo Generando bin\%%M.jar...
+    jar --create --file bin\%%M.jar --manifest manifest.tmp --main-class %%M -C build .
 )
 
 del manifest.tmp
 rmdir /s /q build
 echo.
-echo Listo: WM_WS_M.jar, WM_WS_E.jar y WM_FO.jar
+echo Listo: bin\WM_WS_M.jar, bin\WM_WS_E.jar y bin\WM_FO.jar
 pause

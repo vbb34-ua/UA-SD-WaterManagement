@@ -1,3 +1,10 @@
+package com.watermanagement.central.logica;
+
+import com.watermanagement.central.kafka.KafkaManager;
+import com.watermanagement.central.red.WM_Central_Thread;
+import com.watermanagement.central.panel.Dashboard;
+import com.watermanagement.central.datos.DatabaseManager;
+
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ConcurrentHashMap;

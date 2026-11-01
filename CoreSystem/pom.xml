@@ -19,17 +19,16 @@
             <artifactId>sqlite-jdbc</artifactId>
             <version>3.45.1.0</version>
         </dependency>
-<!-- Source: https://mvnrepository.com/artifact/org.apache.kafka/kafka-clients -->
-<dependency>
-    <groupId>org.apache.kafka</groupId>
-    <artifactId>kafka-clients</artifactId>
-    <version>4.4.0</version>
-</dependency>
+        <dependency>
+            <groupId>org.apache.kafka</groupId>
+            <artifactId>kafka-clients</artifactId>
+            <version>4.4.0</version>
+        </dependency>
     </dependencies>
 
     <build>
         <plugins>
-            <!-- Fat JAR: empaqueta todas las dependencias (SQLite) dentro del JAR -->
+            <!-- Fat JAR: empaqueta todas las dependencias (SQLite y Kafka) dentro del JAR -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>
@@ -45,7 +44,7 @@
                             <transformers>
                                 <!-- Define la clase main para que sea ejecutable con java -jar -->
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
-                                    <mainClass>WM_Central</mainClass>
+                                    <mainClass>com.watermanagement.central.WM_Central</mainClass>
                                 </transformer>
                             </transformers>
                             <filters>

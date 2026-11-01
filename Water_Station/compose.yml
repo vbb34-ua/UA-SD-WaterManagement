@@ -38,11 +38,11 @@ services:
     command: ["WM_WS_E", "${KAFKA_BROKER:-iriguchi.proxy.rlwy.net:38689}", "monitor-ws2", "7000", "WS_02"]
     depends_on: [monitor-ws2]
 
-  # fo1 ejecuta automáticamente los servicios de servicios_ejemplo.txt (sin interacción)
+  # fo1 ejecuta automáticamente los servicios de servicios/servicios_ejemplo.txt (sin interacción)
   fo1:
     <<: *lab
     container_name: fo1
-    command: ["WM_FO", "${KAFKA_BROKER:-iriguchi.proxy.rlwy.net:38689}", "FO_01", "${CENTRAL_HOST:-monorail.proxy.rlwy.net}", "${CENTRAL_PORT:-32265}", "servicios_ejemplo.txt"]
+    command: ["WM_FO", "${KAFKA_BROKER:-iriguchi.proxy.rlwy.net:38689}", "FO_01", "${CENTRAL_HOST:-monorail.proxy.rlwy.net}", "${CENTRAL_PORT:-32265}", "servicios/servicios_ejemplo.txt"]
 
   fo2:
     <<: *lab

@@ -1,7 +1,8 @@
 @echo off
 chcp 65001 > nul
-cd /d "%~dp0"
-REM Arranca el Monitor de una estacion (WM_WS_M.jar ya compilado, no se recompila nada).
+REM Se trabaja desde la carpeta Water_Station (la que contiene bin\ y lib\)
+cd /d "%~dp0.."
+REM Arranca el Monitor de una estacion (bin\WM_WS_M.jar ya compilado, no se recompila nada).
 REM Uso: Arrancar_Monitor.bat [host_central] [puerto_central] [id_WS] [ubicacion] [puerto_local_engine]
 
 call :buscar_java || exit /b 1
@@ -26,7 +27,7 @@ echo ==============================================================
 echo   MONITOR (WM_WS_M) - %WS_ID%
 echo   Central: %CENTRAL_HOST%:%CENTRAL_PORT%  ^|  Puerto Engine: %MONITOR_PORT%
 echo ==============================================================
-java -jar WM_WS_M.jar %MONITOR_PORT% %CENTRAL_HOST% %CENTRAL_PORT% %WS_ID% "%UBICACION%"
+java -jar bin\WM_WS_M.jar %MONITOR_PORT% %CENTRAL_HOST% %CENTRAL_PORT% %WS_ID% "%UBICACION%"
 pause
 exit /b 0
 

@@ -22,11 +22,12 @@ CoreSystem/target/classes/slf4j-api.jar
 CoreSystem/target/classes/slf4j-simple.jar
 CoreSystem/target/classes/sqlite-jdbc.jar
 CoreSystem/target/classes/water_management.db
-CoreSystem/src/main/java/*.class
+CoreSystem/src/main/java/**/*.class
 WaterManagement/Water_Station/*.class
 WaterManagement/Target/classes/*.class
 Water_Station/target/*
 # Water Station: clases compiladas, BDs locales y variables de entorno del laboratorio
-Water_Station/*.class
+Water_Station/**/*.class
+Water_Station/build/
 *.db
 Water_Station/.env

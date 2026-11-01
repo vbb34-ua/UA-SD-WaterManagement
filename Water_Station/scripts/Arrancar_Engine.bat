@@ -1,7 +1,8 @@
 @echo off
 chcp 65001 > nul
-cd /d "%~dp0"
-REM Arranca el Engine de una estacion (WM_WS_E.jar ya compilado, no se recompila nada).
+REM Se trabaja desde la carpeta Water_Station (la que contiene bin\ y lib\)
+cd /d "%~dp0.."
+REM Arranca el Engine de una estacion (bin\WM_WS_E.jar ya compilado, no se recompila nada).
 REM Uso: Arrancar_Engine.bat [broker_kafka] [puerto_monitor] [id_WS]
 
 call :buscar_java || exit /b 1
@@ -22,7 +23,7 @@ echo ==============================================================
 echo   ENGINE (WM_WS_E) - %ID_WS%
 echo   Kafka: %KAFKA_BROKER%  ^|  Monitor: localhost:%MONITOR_PORT%
 echo ==============================================================
-java -jar WM_WS_E.jar %KAFKA_BROKER% localhost %MONITOR_PORT% %ID_WS%
+java -jar bin\WM_WS_E.jar %KAFKA_BROKER% localhost %MONITOR_PORT% %ID_WS%
 pause
 exit /b 0
 

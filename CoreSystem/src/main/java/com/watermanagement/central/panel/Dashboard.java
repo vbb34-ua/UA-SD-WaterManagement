@@ -1,3 +1,7 @@
+package com.watermanagement.central.panel;
+
+import com.watermanagement.central.logica.GestorRiegos;
+
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.LinkedList;
 import java.util.Map;

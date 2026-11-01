@@ -1,3 +1,7 @@
+package com.watermanagement.central.datos;
+
+import com.watermanagement.central.panel.Dashboard;
+
 import java.io.File;
 import java.sql.Connection;
 import java.sql.DriverManager;
