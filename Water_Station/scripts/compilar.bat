@@ -27,7 +27,8 @@ if errorlevel 1 (
 )
 
 REM Manifest con las librerias de Kafka (ruta relativa al .jar: bin\ -> ..\lib\)
-echo Class-Path: ../lib/kafka-clients-4.4.0.jar ../lib/slf4j-api.jar> manifest.tmp
+REM slf4j-nop descarta los logs internos de Kafka (evita el aviso "No SLF4J providers were found")
+echo Class-Path: ../lib/kafka-clients-4.4.0.jar ../lib/slf4j-api.jar ../lib/slf4j-nop-2.0.12.jar> manifest.tmp
 
 if not exist bin mkdir bin
 for %%M in (WM_WS_M WM_WS_E WM_FO) do (

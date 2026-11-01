@@ -132,7 +132,7 @@ Estructura de `Water_Station/`:
 Water_Station/
 ├── src/         código fuente (WM_WS_M, WM_WS_E, WM_FO, Protocolo)
 ├── bin/         .jar ya compilados (WM_WS_M.jar, WM_WS_E.jar, WM_FO.jar)
-├── lib/         librerías (kafka-clients, slf4j-api)
+├── lib/         librerías (kafka-clients, slf4j-api, slf4j-nop)
 ├── scripts/     Arrancar_Monitor.bat, Arrancar_Engine.bat, Arrancar_Operario.bat, compilar.bat
 ├── servicios/   ficheros de servicios del operario (servicios_ejemplo.txt)
 ├── Dockerfile   imagen de laboratorio
