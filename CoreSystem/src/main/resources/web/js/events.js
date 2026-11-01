@@ -1,12 +1,14 @@
-// =====================================================================
-// events.js - Historial de eventos de CENTRAL (vista "Events") y
-// últimos eventos en la vista "Monitoring".
-// =====================================================================
+/**
+ * @file Historial de eventos de CENTRAL (vista "Events", con filtros) y últimos eventos
+ * en la vista "Monitoring".
+ */
 
 import { subscribe, getState } from './store.js';
 import { esc } from './ui.js';
 
+/** Filtros por nivel: [nivel, texto del botón]. */
 const LEVELS = [['all', 'All'], ['danger', 'Alerts'], ['warn', 'Commands'], ['ok', 'Success'], ['info', 'Info']];
+/** Eventos que se muestran en la vista "Monitoring". */
 const RECENT = 8;
 
 let level = 'all';
@@ -41,6 +43,7 @@ function renderChips() {
         `<button class="chip ${level === k ? 'active' : ''}" data-level="${k}">${label}</button>`).join('');
 }
 
+/** Conecta los filtros y la búsqueda del historial, y lo repinta con cada evento nuevo. */
 export function initEvents() {
     renderChips();
     document.getElementById('event-filter').addEventListener('click', e => {

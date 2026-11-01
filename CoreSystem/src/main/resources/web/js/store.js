@@ -1,8 +1,9 @@
-// =====================================================================
-// store.js - Estado del panel y conexión en tiempo real con CENTRAL (SSE).
-// Los demás módulos se suscriben con subscribe() y se repintan al cambiar.
-// =====================================================================
+/**
+ * @file Estado del panel y conexión en tiempo real con CENTRAL (Server-Sent Events).
+ * Los demás módulos se suscriben con subscribe() y se repintan cuando algo cambia.
+ */
 
+/** Estados de una estación (como los envía CENTRAL) y su texto en la interfaz. */
 export const STATUS = {
     DISPONIBLE:     { label: 'Available' },
     REGANDO:        { label: 'Watering' },
@@ -22,7 +23,12 @@ const state = {
 
 const listeners = new Set();
 
-/** fn(state, cambio) con cambio: 'stations' | 'telemetry' | 'logs' | 'selection' | 'connection' */
+/**
+ * Registra una función que se llama en cada cambio del estado.
+ * @param {(state: object, change: string, extra?: any) => void} fn
+ *   change: 'stations' | 'telemetry' (extra = id de la WS) | 'logs' (extra = evento nuevo) |
+ *   'selection' | 'connection'
+ */
 export function subscribe(fn) {
     listeners.add(fn);
 }
@@ -31,23 +37,28 @@ function emit(change, extra) {
     listeners.forEach(fn => fn(state, change, extra));
 }
 
+/** @returns {object} el estado actual (solo lectura para los demás módulos) */
 export function getState() {
     return state;
 }
 
+/**
+ * Abre el detalle de una estación en el panel lateral.
+ * @param {string|null} id id de la estación, o null para cerrarlo
+ */
 export function select(id) {
     state.selected = id;
     emit('selection');
 }
 
-/** Lista de estaciones ordenada por ID. */
+/** @returns {object[]} las estaciones ordenadas por id (WS_2 antes que WS_10) */
 export function stationList() {
     return Object.values(state.stations).sort((a, b) => a.id.localeCompare(b.id, undefined, { numeric: true }));
 }
 
 // ---------------------------------------------------------------- LOGS
 
-/** Clasifica un evento de CENTRAL para colorearlo. */
+/** @returns {'danger'|'warn'|'ok'|'info'} el nivel de un evento de CENTRAL, según su texto, para colorearlo */
 function levelOf(text) {
     if (/ALERTA|FUGA|ABORTADO|DENEGAD|Ca[ií]da|Timeout/i.test(text)) return 'danger';
     if (/bloquea/i.test(text)) return 'warn';
@@ -55,6 +66,7 @@ function levelOf(text) {
     return 'info';
 }
 
+/** Separa la hora del texto en un evento "[hh:mm:ss] mensaje". */
 function parseLog(raw) {
     const m = /^\[(.*?)\] (.*)$/.exec(raw);
     const text = m ? m[2] : raw;
@@ -63,6 +75,10 @@ function parseLog(raw) {
 
 // ---------------------------------------------------------------- SSE
 
+/**
+ * Abre la conexión SSE con CENTRAL (/events). Al conectar se reciben el estado y el historial
+ * completos; después, solo los cambios. Si se corta, el navegador reconecta solo.
+ */
 export function connect() {
     const es = new EventSource('/events');
 
@@ -72,7 +88,6 @@ export function connect() {
     };
 
     es.onerror = () => {
-        // EventSource reintenta solo; mientras tanto se avisa al usuario
         state.connected = false;
         emit('connection');
     };

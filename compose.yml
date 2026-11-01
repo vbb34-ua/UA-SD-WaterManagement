@@ -1,3 +1,8 @@
+# Entorno LOCAL de pruebas (sin Railway): Kafka + WM_Central en este PC.
+#   docker compose up -d --build
+# Central en localhost:6000 (sockets) y http://localhost:8080 (panel). Kafka en localhost:9092.
+# Las estaciones y operarios se lanzan aparte (Water_Station/scripts o Water_Station/compose.yml).
+
 services:
   broker:
     image: apache/kafka

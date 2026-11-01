@@ -1,7 +1,7 @@
-// =====================================================================
-// app.js - Punto de entrada: pestañas, cabecera (contadores y conexión)
-// e inicialización de todos los módulos.
-// =====================================================================
+/**
+ * @file Punto de entrada del panel: pestañas, cabecera (contadores y estado de la conexión)
+ * e inicialización de todos los módulos.
+ */
 
 import { STATUS, connect, subscribe, stationList } from './store.js';
 import { initMap } from './map.js';
@@ -13,10 +13,12 @@ import { esc } from './ui.js';
 
 const VIEWS = ['monitoring', 'stations', 'control', 'events'];
 let currentView = 'monitoring';
+/** Alertas llegadas mientras no se miraba la pestaña "Events" (número rojo de la pestaña). */
 let unseenAlerts = 0;
 
 // ---------------------------------------------------------------- PESTAÑAS
 
+/** Muestra una pestaña y la guarda en la URL (#vista), para que se mantenga al recargar. */
 function showView(view) {
     if (!VIEWS.includes(view)) view = 'monitoring';
     currentView = view;
@@ -37,6 +39,7 @@ function renderBadge() {
 
 // ---------------------------------------------------------------- CABECERA
 
+/** Contadores de estaciones por estado. */
 function renderKpis() {
     const counts = {};
     stationList().forEach(ws => { counts[ws.estado] = (counts[ws.estado] || 0) + 1; });
@@ -66,7 +69,7 @@ document.addEventListener('DOMContentLoaded', () => {
     document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => showView(t.dataset.view)));
     window.addEventListener('hashchange', () => showView(location.hash.slice(1)));
 
-    // Contador de la cabecera -> tabla filtrada por ese estado
+    // Pinchar un contador abre la tabla filtrada por ese estado
     document.getElementById('kpis').addEventListener('click', e => {
         const kpi = e.target.closest('[data-status]');
         if (!kpi) return;

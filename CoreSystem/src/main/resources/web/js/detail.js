@@ -1,7 +1,7 @@
-// =====================================================================
-// detail.js - Panel lateral con el detalle de una estación y sus órdenes
-// (iniciar riego, bloquear, activar). Se abre al pinchar una estación.
-// =====================================================================
+/**
+ * @file Panel lateral con el detalle de una estación y sus órdenes (iniciar riego, bloquear,
+ * activar). Se abre al pinchar una estación en el mapa, la tabla o las listas.
+ */
 
 import { STATUS, subscribe, getState, select } from './store.js';
 import { sendAction } from './api.js';
@@ -9,11 +9,13 @@ import { esc, showResult } from './ui.js';
 
 const $ = id => document.getElementById(id);
 
+/** @returns {object|null} la estación abierta en el panel */
 function current() {
     const { selected, stations } = getState();
     return selected ? stations[selected] : null;
 }
 
+/** Abre, cierra o actualiza el panel según la estación seleccionada. */
 function render() {
     const ws = current();
     const drawer = $('drawer');
@@ -49,6 +51,7 @@ function render() {
     $('d-activate').hidden = !blocked;
 }
 
+/** Envía una orden a la estación abierta y muestra el resultado. */
 async function act(action) {
     const ws = current();
     if (!ws) return;
@@ -62,6 +65,7 @@ async function act(action) {
     showResult(result, messages[action]);
 }
 
+/** Conecta los botones del panel; se cierra con la X, pinchando fuera o con Escape. */
 export function initDetail() {
     $('d-close').addEventListener('click', () => select(null));
     $('drawer-backdrop').addEventListener('click', () => select(null));

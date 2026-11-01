@@ -20,26 +20,29 @@ import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 
 /**
- * WM_FO - Aplicación del operario de campo.
+ * WM_FO: aplicación del operario de campo.
  *
- *  - Socket con WM_Central: registro, solicitudes de riego (ACTIVAR) y notificaciones.
- *  - Kafka (topic wm-eventos): telemetría en tiempo real de la WS que le está regando.
+ * <ul>
+ *   <li>Socket con WM_Central: registro, solicitudes de riego (ACTIVAR) y notificaciones.</li>
+ *   <li>Kafka (topic {@value #TOPIC_EVENTOS}): telemetría en tiempo real de la WS que le está regando.</li>
+ * </ul>
  *
- * Fichero de servicios: una línea por servicio, "ID_WS" o "ID_WS,segundos" (ej. "WS_01,20").
- * Las líneas vacías o que empiezan por '#' se ignoran.
+ * <p>Fichero de servicios: una línea por servicio, {@code ID_WS} o {@code ID_WS,segundos}
+ * (p. ej. {@code WS_01,20}). Las líneas vacías o que empiezan por '#' se ignoran. Si se indica
+ * como último parámetro, se ejecuta automáticamente al arrancar (sin interacción) y después
+ * se muestra el menú.
  *
- * Si se indica un fichero de servicios como último parámetro, se ejecuta automáticamente al arrancar
- * (sin interacción) y después se muestra el menú.
- * Mensajes con Central en tramas <STX>DATA<ETX><LRC> con respuesta ACK/NACK (clase Protocolo).
+ * <p>Los mensajes con CENTRAL usan tramas {@link Protocolo} con respuesta ACK/NACK.
  *
- * Uso: java WM_FO <ip_broker:puerto> <id_operador> [ip_central] [puerto_central] [fichero_servicios]
+ * <p>Uso: {@code java WM_FO <ip_broker:puerto> <id_operador> [ip_central] [puerto_central] [fichero_servicios]}
  */
 public class WM_FO {
 
     private static final String TOPIC_EVENTOS = "wm-eventos";
     private static final int DURACION_DEFECTO_S = 15;
+    /** Se envía PING a CENTRAL si no se le ha enviado nada en este tiempo. */
     private static final long INTERVALO_PING_MS = 5000;
-    /** Central responde ACK a cada PING. Sin nada en 20 s, el socket está semiabierto. */
+    /** CENTRAL responde ACK a cada PING: sin nada en 20 s, el socket está semiabierto. */
     private static final int TIMEOUT_LECTURA_MS = 20000;
 
     private final String brokerAddress;
@@ -59,6 +62,7 @@ public class WM_FO {
     /** Estación que está prestando servicio a este operario (para filtrar la telemetría de Kafka). */
     private volatile String wsEnServicio = null;
 
+    // Fin del servicio en curso: el modo automático espera aquí antes de pasar al siguiente
     private boolean servicioConcluido = false;
     private String ultimoMensajeConclusion = "";
     private final Object lockServicio = new Object();
@@ -66,6 +70,10 @@ public class WM_FO {
     /** Fichero de servicios a ejecutar automáticamente al arrancar (null = solo menú). */
     private final String ficheroAutomatico;
 
+    /**
+     * @param brokerAddress     dirección host:puerto de Kafka
+     * @param ficheroAutomatico fichero de servicios a ejecutar al arrancar, o null para usar solo el menú
+     */
     public WM_FO(String brokerAddress, String idOperador, String ipCentral, int puertoCentral, String ficheroAutomatico) {
         this.brokerAddress = brokerAddress;
         this.idOperador = idOperador;
@@ -74,6 +82,10 @@ public class WM_FO {
         this.ficheroAutomatico = ficheroAutomatico;
     }
 
+    /**
+     * Arranca los hilos de conexión con CENTRAL, PING y consumidor de Kafka; ejecuta el fichero
+     * automático si lo hay (tras conectar con CENTRAL) y después muestra el menú.
+     */
     public void iniciar() {
         System.out.println("===============================================================");
         System.out.println("   WATER MANAGEMENT - FIELD OPERATOR (WM_FO)");
@@ -81,16 +93,10 @@ public class WM_FO {
         System.out.println("   Central: [" + ipCentral + ":" + puertoCentral + "]");
         System.out.println("===============================================================");
 
-        // Estrategia 1: conexión y reconexión continua a la Central
         new Thread(this::gestorConexionCentral, "Hilo-Conexion-Central").start();
-
-        // Estrategia 2: latido para que Central no cierre la sesión por inactividad
         new Thread(this::buclePing, "Hilo-Ping-Central").start();
-
-        // Telemetría de la WS en servicio a través de Kafka
         new Thread(this::hiloConsumidorBroker, "Hilo-Kafka-Consumidor").start();
 
-        // Modo automático: ejecuta el fichero de servicios sin interacción y después muestra el menú
         if (ficheroAutomatico != null) {
             System.out.println("[MODO AUTOMÁTICO] Esperando conexión con WM_Central para ejecutar '" + ficheroAutomatico + "'...");
             while (enEjecucion && !registradoEnCentral) dormir(500);
@@ -102,7 +108,10 @@ public class WM_FO {
 
     // ---------------------------------------------------------------- CONEXIÓN CON CENTRAL
 
-    // Estrategia 1: reconexión con backoff (2, 4, 8 ... 30 s) y re-autenticación automática
+    /**
+     * Conecta con CENTRAL, se registra y atiende sus mensajes. Si la conexión se pierde o no se
+     * puede establecer, reintenta con espera exponencial (2, 4, 8... hasta 30 s) y se vuelve a registrar.
+     */
     private void gestorConexionCentral() {
         int esperaMs = 2000;
         final int maxEsperaMs = 30000;
@@ -110,7 +119,7 @@ public class WM_FO {
         while (enEjecucion) {
             if (conectarYRegistrarEnCentral()) {
                 esperaMs = 2000;
-                bucleEscuchaCentral(); // Hasta que se pierda la conexión
+                bucleEscuchaCentral();
             }
             if (!enEjecucion) break;
             System.err.println("[OPERADOR] Reintentando conexión con WM_Central en " + (esperaMs / 1000) + " s...");
@@ -119,6 +128,12 @@ public class WM_FO {
         }
     }
 
+    /**
+     * Abre la conexión y envía REGISTRO_OPERARIO. Si CENTRAL no conoce al operario, la
+     * aplicación termina (no tiene sentido reintentar).
+     *
+     * @return true si CENTRAL ha aceptado el registro
+     */
     private boolean conectarYRegistrarEnCentral() {
         try {
             System.out.println("[OPERADOR] Conectando a WM_Central (" + ipCentral + ":" + puertoCentral + ")...");
@@ -156,11 +171,12 @@ public class WM_FO {
         }
     }
 
+    /** Atiende los mensajes de CENTRAL hasta que la conexión se pierde. */
     private void bucleEscuchaCentral() {
         try {
             while (enEjecucion) {
                 String trama = entradaCentral.readUTF();
-                if (Protocolo.esAck(trama)) continue;   // Respuesta de Central a una trama nuestra
+                if (Protocolo.esAck(trama)) continue;
                 if (Protocolo.esNack(trama)) {
                     System.err.println("[OPERADOR] WM_Central ha rechazado una trama (NACK"
                             + (trama.length() > 1 ? ": " + trama.substring(1) : "") + ").");
@@ -174,7 +190,7 @@ public class WM_FO {
                 }
                 enviarRaw(Protocolo.S_ACK);
                 if (mensaje.startsWith("SERVICIO_EN_CURSO:")) {
-                    // Tras reconectar: Central indica que una WS sigue regando para este operario
+                    // Tras reconectar: una WS sigue regando para este operario, se vuelve a mostrar su telemetría
                     wsEnServicio = mensaje.substring(mensaje.indexOf(':') + 1).trim();
                     System.out.println("\n>>> [CENTRAL] Su riego en la estación " + wsEnServicio
                             + " sigue en curso. Mostrando su telemetría.");
@@ -201,6 +217,7 @@ public class WM_FO {
         }
     }
 
+    /** Marca el servicio en curso como terminado y despierta al modo automático si está esperando. */
     private void concluirServicio(String mensaje) {
         wsEnServicio = null;
         synchronized (lockServicio) {
@@ -210,6 +227,7 @@ public class WM_FO {
         }
     }
 
+    /** @return true si el mensaje termina el servicio en curso (resumen, denegación, error o aborto) */
     private boolean esFinDeServicio(String msg) {
         return msg.startsWith("RESUMEN_FIN_RIEGO:") ||
                 msg.startsWith("DENEGADO:") ||
@@ -217,6 +235,7 @@ public class WM_FO {
                 msg.startsWith("ABORTADO:");
     }
 
+    /** Muestra un mensaje de CENTRAL con un formato según su tipo (prefijo antes de ':'). */
     private void imprimirMensajeCentral(String msg) {
         String hora = new SimpleDateFormat("HH:mm:ss").format(new Date());
 
@@ -238,7 +257,11 @@ public class WM_FO {
         System.out.print("> ");
     }
 
-    /** Envía DATA a Central empaquetado en trama <STX>DATA<ETX><LRC>. */
+    /**
+     * Envía los datos a CENTRAL empaquetados en una trama.
+     *
+     * @throws IOException si no hay conexión
+     */
     private void enviarTrama(String datos) throws IOException {
         synchronized (lockEnvio) {
             if (salidaCentral == null || socketCentral == null || socketCentral.isClosed()) {
@@ -250,7 +273,7 @@ public class WM_FO {
         }
     }
 
-    /** Envía un ACK/NACK a Central. */
+    /** Envía un ACK o NACK a CENTRAL (sin trama). */
     private void enviarRaw(String contenido) {
         synchronized (lockEnvio) {
             try {
@@ -262,7 +285,10 @@ public class WM_FO {
         }
     }
 
-    // Estrategia 2: ping a Central cuando no hay tráfico
+    /**
+     * Envía PING a CENTRAL cuando lleva {@value #INTERVALO_PING_MS} ms sin enviarle nada, para que
+     * CENTRAL no cierre la sesión por inactividad y para detectar un socket semiabierto.
+     */
     private void buclePing() {
         while (enEjecucion) {
             dormir(1000);
@@ -276,6 +302,7 @@ public class WM_FO {
 
     // ---------------------------------------------------------------- KAFKA
 
+    /** Consume {@value #TOPIC_EVENTOS} con un grupo propio del operario; si Kafka falla, reintenta cada 5 s. */
     private void hiloConsumidorBroker() {
         Properties props = new Properties();
         props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, brokerAddress);
@@ -301,13 +328,16 @@ public class WM_FO {
         }
     }
 
+    /**
+     * Muestra la telemetría ({@code TELEMETRIA#ws#operario#caudal#volumen}) si es reciente, de la WS
+     * que está regando para este operario y de su propio riego.
+     */
     private void procesarEventoKafka(ConsumerRecord<String, String> r) {
         if (r.value() == null || System.currentTimeMillis() - r.timestamp() > 10000) return;
         String ws = wsEnServicio;
-        if (ws == null || !ws.equals(r.key())) return; // Solo la WS que presta servicio a este operario
+        if (ws == null || !ws.equals(r.key())) return;
 
         String[] p = r.value().split("#", -1);
-        // TELEMETRIA#ws#operario#caudal#volumen
         if ("TELEMETRIA".equals(p[0]) && p.length >= 5 && idOperador.equals(p[2])) {
             System.out.println("[" + new SimpleDateFormat("HH:mm:ss").format(new Date()) + "] [KAFKA] " + ws
                     + " regando | Caudal: " + p[3] + " L/min | Volumen acumulado: " + p[4] + " L");
@@ -316,6 +346,11 @@ public class WM_FO {
 
     // ---------------------------------------------------------------- SERVICIOS
 
+    /**
+     * Envía a CENTRAL la solicitud de riego. El resultado llega después como mensaje de CENTRAL.
+     *
+     * @return false si no hay conexión con CENTRAL
+     */
     public boolean solicitarRiego(String idWs, int duracion) {
         try {
             System.out.println("\n[OPERADOR] Enviando solicitud de riego para WS [" + idWs + "] (" + duracion + " s)...");
@@ -333,6 +368,10 @@ public class WM_FO {
         }
     }
 
+    /**
+     * Ejecuta los servicios del fichero uno tras otro: pide cada riego, espera a que termine
+     * (o se deniegue) y deja 4 s antes del siguiente.
+     */
     public void procesarFicheroServicios(String rutaFichero) {
         File archivo = new File(rutaFichero);
         if (!archivo.exists() || !archivo.isFile()) {
@@ -379,6 +418,7 @@ public class WM_FO {
         System.out.println("[MODO AUTOMÁTICO] Todos los servicios del fichero han sido procesados.");
     }
 
+    /** @return el mensaje que terminó el servicio, o un aviso de TIMEOUT si no llega a tiempo */
     private String esperarConclusion(long timeoutMs) {
         synchronized (lockServicio) {
             long inicio = System.currentTimeMillis();
@@ -399,6 +439,7 @@ public class WM_FO {
         }
     }
 
+    /** Pide a CENTRAL el listado de estaciones; la respuesta llega como LISTA_ESTACIONES. */
     public void consultarEstacionesDisponibles() {
         try {
             enviarTrama("LISTAR_WS#" + idOperador);
@@ -471,6 +512,11 @@ public class WM_FO {
         try { Thread.sleep(ms); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
     }
 
+    /**
+     * @param args {@code <ip_broker:puerto> <id_operador> [ip_central] [puerto_central] [fichero_servicios]};
+     *             CENTRAL también se puede indicar como {@code ip:puerto} en el tercer argumento
+     *             (por defecto localhost:6000)
+     */
     public static void main(String[] args) {
         if (args.length < 2) {
             System.out.println("Uso: java WM_FO <ip_broker:puerto> <id_operador> [ip_central] [puerto_central] [fichero_servicios]");

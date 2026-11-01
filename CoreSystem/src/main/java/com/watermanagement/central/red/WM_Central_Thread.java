@@ -12,11 +12,12 @@ import java.net.SocketTimeoutException;
 
 /**
  * Hilo que atiende una conexión de socket con CENTRAL: un Monitor de WS (WM_WS_M)
- * o una aplicación de operario (WM_FO).
+ * o una aplicación de operario (WM_FO). El tipo de cliente queda fijado por su
+ * primer mensaje ({@code REGISTRO} o {@code REGISTRO_OPERARIO}).
  *
- * Protocolo (en ambos sentidos): <STX>CODIGO#campo1#...#campoN<ETX><LRC>,
- * LRC = XOR de todos los caracteres desde STX hasta ETX. Quien recibe una trama
- * responde <ACK> si es correcta o <NACK>[motivo] si no lo es.
+ * <p>Protocolo (en ambos sentidos): {@code <STX>CODIGO#campo1#...#campoN<ETX><LRC>},
+ * con LRC = XOR de todos los caracteres desde STX hasta ETX. Quien recibe una trama
+ * responde {@code <ACK>} si es correcta o {@code <NACK>[motivo]} si no lo es.
  */
 public class WM_Central_Thread extends Thread {
 
@@ -27,7 +28,7 @@ public class WM_Central_Thread extends Thread {
     private static final char ACK = 0x06;
     private static final char NACK = 0x15;
 
-    /** Estrategia 2: si en 15 s no llega nada (telemetría, ping...) la conexión se da por caída. */
+    /** Sin ningún mensaje en este tiempo (los clientes envían PING cada 5 s) la conexión se da por caída. */
     private static final int TIMEOUT_LECTURA_MS = 15000;
 
     private final Socket skCliente;
@@ -38,15 +39,22 @@ public class WM_Central_Thread extends Thread {
     private String idConexion = null;
     private volatile long ultimaActividadMs = System.currentTimeMillis();
 
+    /** Acción pendiente de ejecutar justo después de enviar la respuesta de la operación actual. */
+    private Runnable trasRespuesta = null;
+
+    /** @param p_cliente socket ya aceptado por el ServerSocket de CENTRAL */
     public WM_Central_Thread(Socket p_cliente) {
         this.skCliente = p_cliente;
     }
 
     // ---------------------------------------------------------------- E/S
 
-    /** Acción a ejecutar justo después de enviar la respuesta (ACK) de la operación actual. */
-    private Runnable trasRespuesta = null;
-
+    /**
+     * Escribe una cadena en el socket. Sincronizado porque otros hilos (GestorRiegos,
+     * panel web) también envían mensajes a este cliente.
+     *
+     * @return false si el socket ya no admite escritura
+     */
     private synchronized boolean escribeSocket(String datos) {
         try {
             salida.writeUTF(datos);
@@ -58,33 +66,47 @@ public class WM_Central_Thread extends Thread {
         }
     }
 
-    /** Trama con formato STX/ETX/LRC (hacia los Monitores). */
+    /**
+     * Envía un mensaje empaquetado como {@code <STX>datos<ETX><LRC>}.
+     *
+     * @param datos contenido de la trama, p. ej. {@code SOLICITUD_RIEGO#R1#FO_01#20}
+     * @return false si no se pudo enviar (cliente desconectado)
+     */
     public boolean enviarTrama(String datos) {
         String mensaje = STX + datos + ETX;
         return escribeSocket(mensaje + calcularLRC(mensaje));
     }
 
-    /** Mensaje informativo para un operario, también en trama STX/ETX/LRC. Devuelve false si no se pudo enviar. */
+    /**
+     * Envía un texto informativo a un operario ({@code AUTORIZADO: ...}, {@code AVISO: ...}).
+     * Va en una trama igual que el resto de mensajes.
+     *
+     * @return false si no se pudo enviar (operario desconectado)
+     */
     public boolean enviarTexto(String texto) {
         return enviarTrama(texto);
     }
 
     /**
-     * Programa una acción para después del ACK (ej. entregar el buzón tras el registro),
-     * para que el cliente no reciba otros mensajes antes de la respuesta a su registro.
+     * Programa una acción para después de enviar el ACK de la operación actual, de modo que
+     * el cliente reciba la respuesta a su mensaje antes que cualquier otro (p. ej. el buzón
+     * de mensajes pendientes tras el registro de un operario).
      */
     public void alTerminarRespuesta(Runnable accion) {
         this.trasRespuesta = accion;
     }
 
+    /** @return milisegundos transcurridos desde el último mensaje recibido de este cliente */
     public long msDesdeUltimaActividad() {
         return System.currentTimeMillis() - ultimaActividadMs;
     }
 
+    /** Cierra el socket; el bucle de {@link #run()} termina y se notifica la desconexión. */
     public void cerrar() {
         try { skCliente.close(); } catch (IOException ignored) {}
     }
 
+    /** @return XOR de todos los caracteres del mensaje (de STX a ETX, ambos incluidos) */
     private static char calcularLRC(String mensaje) {
         char lrc = 0;
         for (int i = 0; i < mensaje.length(); i++) {
@@ -119,7 +141,12 @@ public class WM_Central_Thread extends Thread {
         try { return Integer.parseInt(s.trim()); } catch (Exception e) { return defecto; }
     }
 
-    /** Devuelve la respuesta que se envía al cliente (ACK/NACK) o null si no hay que responder. */
+    /**
+     * Ejecuta la operación indicada por el primer campo de la trama.
+     *
+     * @param data contenido de la trama ya validada (sin STX, ETX ni LRC)
+     * @return la respuesta para el cliente (ACK o NACK con motivo), o null si no hay que responder
+     */
     private String ejecutarOperacion(String data) {
         String[] partes = data.split("#", -1);
         String operacion = partes[0];
@@ -213,12 +240,16 @@ public class WM_Central_Thread extends Thread {
 
     // ---------------------------------------------------------------- BUCLE
 
+    /**
+     * Lee tramas hasta que el cliente se desconecta o pasa {@value #TIMEOUT_LECTURA_MS} ms
+     * sin enviar nada. Al salir avisa a {@link GestorRiegos} para que actualice el estado
+     * (la WS pasa a DESCONECTADA y se aborta su riego, o el operario queda fuera de línea).
+     */
     @Override
     public void run() {
         try {
             entrada = new DataInputStream(skCliente.getInputStream());
             salida = new DataOutputStream(skCliente.getOutputStream());
-            // Estrategia 2: timeout de lectura para detectar caídas e inactividad
             skCliente.setSoTimeout(TIMEOUT_LECTURA_MS);
 
             while (true) {

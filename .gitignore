@@ -1,33 +1,15 @@
-.vscode/settings.json
-CoreSystem/target/central-1.0-SNAPSHOT.jar
-CoreSystem/target/maven-archiver/pom.properties
-CoreSystem/target/classes/DatabaseManager.class
-CoreSystem/target/classes/WM_Central_Thread.class
-CoreSystem/target/classes/WM_Central.class
-CoreSystem/target/classes/Dashboard.class
-CoreSystem/target/classes/Dashboard$1.class
-CoreSystem/target/classes/Dashboard$Estado.class
-CoreSystem/target/classes/Dashboard$WSInfo.class
-CoreSystem/src/main/java/Dashboard.class
-CoreSystem/src/main/java/Dashboard$1.class
-CoreSystem/src/main/java/Dashboard$Estado.class
-CoreSystem/src/main/java/Dashboard$WSInfo.class
-CoreSystem/src/main/java/DatabaseManager.class
-CoreSystem/src/main/java/WM_Central.class
-CoreSystem/src/main/java/WM_Central_Thread.class
-CoreSystem/src/main/java/water_management.db
-CoreSystem/target/*
-CoreSystem/target/classes/Arrancar_Central.bat
-CoreSystem/target/classes/slf4j-api.jar
-CoreSystem/target/classes/slf4j-simple.jar
-CoreSystem/target/classes/sqlite-jdbc.jar
-CoreSystem/target/classes/water_management.db
-CoreSystem/src/main/java/**/*.class
-WaterManagement/Water_Station/*.class
-WaterManagement/Target/classes/*.class
-Water_Station/target/*
-# Water Station: clases compiladas, BDs locales y variables de entorno del laboratorio
-Water_Station/**/*.class
+# Editores
+.vscode/
+.idea/
+*.iml
+
+# Compilación (Maven genera target/; compilar.bat usa build/ de forma temporal)
+CoreSystem/target/
 Water_Station/build/
+*.class
+
+# Bases de datos SQLite locales (CENTRAL las crea al arrancar)
 *.db
+
+# Variables del laboratorio para Water_Station/compose.yml
 Water_Station/.env

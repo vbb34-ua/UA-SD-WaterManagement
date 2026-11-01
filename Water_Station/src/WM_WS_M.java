@@ -12,34 +12,40 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * WM_WS_M - Monitor de la estación de riego.
+ * WM_WS_M: Monitor de la estación de riego.
  *
- *  - Se autentica en WM_Central (REGISTRO#id#ubicacion) y le reporta averías,
- *    telemetría y fin de riego.
- *  - Ofrece un ServerSocket al Engine (WM_WS_E) y le envía HEALTH_CHECK cada segundo.
- *    Si el Engine responde KO o no responde, notifica una FUGA a Central.
- *  - Autoriza o deniega las solicitudes de riego de Central y controla la duración
- *    del riego (al cumplirse, ordena al Engine FINALIZAR_RIEGO).
+ * <ul>
+ *   <li>Se autentica en WM_Central ({@code REGISTRO#id#ubicacion}) y le informa de averías,
+ *       telemetría y fin de riego.</li>
+ *   <li>Abre un ServerSocket para el Engine (WM_WS_E) y le envía HEALTH_CHECK cada segundo.
+ *       Si el Engine responde KO o no responde, notifica una avería (FUGA) a CENTRAL.</li>
+ *   <li>Autoriza o deniega las solicitudes de riego de CENTRAL y controla la duración
+ *       del riego (al cumplirse, ordena al Engine FINALIZAR_RIEGO).</li>
+ * </ul>
  *
- * Tolerancia a fallos:
- *  - Si cae WM_Central, el riego en curso continúa hasta terminar. Los FIN_RIEGO se guardan
- *    y se reenvían al reconectar hasta que Central los confirma (CONFIRMACION_FIN).
- *  - Si cae el Engine regando, se guarda lo regado (última telemetría) y se envía a Central
- *    cuando la avería se resuelve.
+ * <p>Tolerancia a fallos:
+ * <ul>
+ *   <li>Si cae WM_Central, el riego en curso continúa hasta terminar. Los FIN_RIEGO se guardan
+ *       y se reenvían al reconectar hasta que CENTRAL los confirma (CONFIRMACION_FIN).</li>
+ *   <li>Si cae el Engine regando, se guarda lo regado (última telemetría) y se envía a CENTRAL
+ *       cuando la avería se resuelve.</li>
+ * </ul>
  *
- * Todos los mensajes por socket usan el protocolo <STX>DATA<ETX><LRC> con respuesta ACK/NACK (clase Protocolo).
+ * <p>Todos los mensajes por socket usan tramas {@link Protocolo} con respuesta ACK/NACK.
  *
- * Uso: java WM_WS_M <puerto_para_Engine> <IP_Central> <puerto_Central> <id_WS> [ubicacion]
+ * <p>Uso: {@code java WM_WS_M <puerto_para_Engine> <IP_Central> <puerto_Central> <id_WS> [ubicacion]}
  */
 public class WM_WS_M {
 
     private static final long INTERVALO_HEALTH_MS = 1000;
     private static final long TIMEOUT_RESPUESTA_ENGINE_MS = 3000;
+    /** Tiempo que se espera a que el Engine se conecte al arrancar antes de considerarlo averiado. */
     private static final long GRACIA_ARRANQUE_MS = 5000;
+    /** Se envía PING a CENTRAL si no se le ha enviado nada en este tiempo. */
     private static final long INTERVALO_PING_MS = 5000;
-    /** Central responde ACK a cada PING (cada 5 s). Sin nada en 20 s, el socket está semiabierto. */
+    /** CENTRAL responde ACK a cada PING (cada 5 s): sin nada en 20 s, el socket está semiabierto. */
     private static final int TIMEOUT_LECTURA_CENTRAL_MS = 20000;
-    /** Si tras autorizar no llega telemetría en este tiempo, se envía INICIO_RIEGO por socket. */
+    /** Si tras autorizar no llega telemetría en este tiempo, Kafka no ha entregado INICIO_RIEGO y se envía por socket. */
     private static final long ESPERA_KAFKA_MS = 6000;
 
     private final int puertoLocalEngine;
@@ -49,7 +55,7 @@ public class WM_WS_M {
     private final String ubicacion;
     private final long arranqueMs = System.currentTimeMillis();
 
-    // Conexión con Central
+    // Conexión con CENTRAL
     private volatile Socket socketCentral;
     private DataOutputStream salidaCentral;
     private DataInputStream entradaCentral;
@@ -65,27 +71,35 @@ public class WM_WS_M {
     private volatile String ultimoEstadoEngine = null;
     private volatile boolean engineConectadoAlgunaVez = false;
 
-    // Estado de salud y riego (protegido por lockRiego)
     private volatile boolean enEjecucion = true;
     private volatile boolean averiaActiva = false;
+
+    // Riego en curso (protegido por lockRiego)
     private final Object lockRiego = new Object();
     private boolean enRiego = false;
     private String riegoId = null;
     private String operarioRiego = null;
     private int duracionS = 0;
     private long autorizadoMs = 0;
+    /** Momento de la primera telemetría: la duración del riego se cuenta desde que la válvula se abre. */
     private long inicioTelemetriaMs = 0;
     private String ultimoVolumen = "0.00";
+    /** Ya se envió INICIO_RIEGO por socket porque Kafka no lo entregó a tiempo. */
     private boolean respaldoEnviado = false;
+    /** Ya se ordenó FINALIZAR_RIEGO al Engine (para no repetir la orden). */
     private boolean finSolicitado = false;
-    /** FIN construido por el Monitor cuando el Engine cae regando; se envía al resolverse la avería. */
-    private String[] finRetenido = null; // {riegoId, trama}
+    /** {riegoId, volumen, segundos} del riego cortado al caer el Engine; se envía al resolverse la avería. */
+    private String[] finRetenido = null;
     /** Riegos que el Engine abrió sin autorización del Monitor (se ignoran sus FIN). */
     private final Set<String> riegosDescartados = new HashSet<>();
 
-    /** FIN_RIEGO enviados (o por enviar) a Central y aún no confirmados: riegoId -> trama. */
+    /** FIN_RIEGO enviados (o por enviar) a CENTRAL y aún no confirmados: riegoId -> trama. */
     private final Map<String, String> finesSinConfirmar = new LinkedHashMap<>();
 
+    /**
+     * @param puertoLocalEngine puerto en el que se espera la conexión del Engine
+     * @param ubicacion         ubicación de la estación, o vacía para usar la registrada en CENTRAL
+     */
     public WM_WS_M(int puertoLocalEngine, String ipCentral, int puertoCentral, String idWS, String ubicacion) {
         this.puertoLocalEngine = puertoLocalEngine;
         this.ipCentral = ipCentral;
@@ -94,17 +108,16 @@ public class WM_WS_M {
         this.ubicacion = ubicacion.replace("#", " ");
     }
 
+    /**
+     * Arranca los hilos de conexión con el Engine y con CENTRAL y el PING, y ejecuta la
+     * supervisión de salud en el hilo actual (no vuelve).
+     */
     public void iniciar() {
         System.out.println("=== ARRANCANDO MONITOR (WM_WS_M) - WS ID: " + idWS + " | Ubicación: "
                 + (ubicacion.isEmpty() ? "(la registrada en CENTRAL)" : ubicacion) + " ===");
 
-        // Estrategia 4: ServerSocket del Engine siempre a la escucha
         new Thread(this::bucleAceptarEngine, "Hilo-ServerSocket-Engine").start();
-
-        // Estrategia 1: conexión y reconexión con backoff a Central
         new Thread(this::bucleConexionCentral, "Hilo-Conexion-Central").start();
-
-        // Estrategia 2: latido hacia Central cuando no hay tráfico
         new Thread(this::buclePingCentral, "Hilo-Ping-Central").start();
 
         bucleSupervisionSalud();
@@ -112,7 +125,11 @@ public class WM_WS_M {
 
     // ================================================================ CENTRAL
 
-    // Estrategia 1: reconexión con backoff exponencial (2, 4, 8 ... 30 s)
+    /**
+     * Conecta con CENTRAL, se registra y atiende sus mensajes. Si la conexión se pierde o no se
+     * puede establecer, reintenta con espera exponencial (2, 4, 8... hasta 30 s). La primera vez
+     * que falla avisa al Engine de que no se admiten nuevos riegos.
+     */
     private void bucleConexionCentral() {
         int esperaMs = 2000;
         final int maxEsperaMs = 30000;
@@ -169,7 +186,7 @@ public class WM_WS_M {
         }
     }
 
-    /** REGISTRO#id#ubicacion, más el riego en curso si lo hay (para que Central lo recupere). */
+    /** @return {@code REGISTRO#id#ubicacion}, más {@code #riegoId#operario#duracion} si hay un riego en curso para que CENTRAL lo recupere */
     private String tramaRegistro() {
         synchronized (lockRiego) {
             if (enRiego) {
@@ -179,7 +196,10 @@ public class WM_WS_M {
         return "REGISTRO#" + idWS + "#" + ubicacion;
     }
 
-    /** Tras registrarse: estado de avería y todos los FIN_RIEGO no confirmados. */
+    /**
+     * Tras registrarse, envía a CENTRAL lo que no pudo recibir mientras estaba desconectada:
+     * la avería activa y los FIN_RIEGO sin confirmar. Termina con SINCRONIZADO.
+     */
     private void sincronizarConCentral() {
         if (averiaActiva) enviarACentralSeguro("AVERIA#" + idWS);
         List<String> fines;
@@ -193,10 +213,15 @@ public class WM_WS_M {
         enviarACentralSeguro("SINCRONIZADO#" + idWS);
     }
 
+    /**
+     * Atiende los mensajes de CENTRAL hasta que la conexión se pierde.
+     *
+     * @throws IOException al perder la conexión (o tras 20 s sin recibir nada)
+     */
     private void iniciarEscuchaCentral() throws IOException {
         while (enEjecucion) {
             String mensaje = entradaCentral.readUTF();
-            if (Protocolo.esAck(mensaje)) continue;          // Respuesta de Central a una trama nuestra
+            if (Protocolo.esAck(mensaje)) continue;
             if (Protocolo.esNack(mensaje)) {
                 System.err.println("[MONITOR] WM_Central ha rechazado una trama (NACK"
                         + (mensaje.length() > 1 ? ": " + mensaje.substring(1) : "") + ").");
@@ -234,6 +259,10 @@ public class WM_WS_M {
         }
     }
 
+    /**
+     * Autoriza el riego si no hay avería, el Engine está conectado y no se está regando ya.
+     * La válvula no se abre aquí: el Engine la abre al recibir INICIO_RIEGO por Kafka.
+     */
     private void atenderSolicitudRiego(String id, String operario, String duracion) {
         String motivo = null;
         synchronized (lockRiego) {
@@ -264,12 +293,12 @@ public class WM_WS_M {
         }
     }
 
-    /** Envía DATA a Central empaquetado en trama <STX>DATA<ETX><LRC>. */
+    /** Envía los datos a CENTRAL empaquetados en una trama. */
     private void enviarACentral(String datos) throws IOException {
         enviarRawCentral(Protocolo.empaquetar(datos));
     }
 
-    /** Escribe tal cual en el socket de Central (tramas ya empaquetadas o ACK/NACK). */
+    /** Escribe tal cual en el socket de CENTRAL (una trama ya empaquetada, o un ACK/NACK). */
     private void enviarRawCentral(String contenido) throws IOException {
         synchronized (lockCentral) {
             if (salidaCentral == null || socketCentral == null || socketCentral.isClosed()) {
@@ -281,7 +310,11 @@ public class WM_WS_M {
         }
     }
 
-    /** Envía a Central si hay conexión. Devuelve false si no fue posible. */
+    /**
+     * Envía a CENTRAL si la estación está registrada, sin lanzar excepciones.
+     *
+     * @return false si no hay conexión
+     */
     private boolean enviarACentralSeguro(String datos) {
         if (!registrado && !datos.startsWith("REGISTRO")) return false;
         try {
@@ -301,7 +334,10 @@ public class WM_WS_M {
         }
     }
 
-    // Estrategia 2: ping a Central solo cuando no hay tráfico (evita sockets semiabiertos)
+    /**
+     * Envía PING a CENTRAL cuando lleva {@value #INTERVALO_PING_MS} ms sin enviarle nada, para que
+     * CENTRAL no cierre la conexión por inactividad y para detectar un socket semiabierto.
+     */
     private void buclePingCentral() {
         while (enEjecucion) {
             dormir(1000);
@@ -311,7 +347,10 @@ public class WM_WS_M {
         }
     }
 
-    /** Guarda el FIN hasta que Central lo confirme y lo envía si hay conexión. */
+    /**
+     * Guarda el FIN_RIEGO hasta que CENTRAL lo confirme y lo envía si hay conexión;
+     * si no la hay, se envía al reconectar ({@link #sincronizarConCentral()}).
+     */
     private void registrarFinRiego(String id, String volumen, String duracion, String motivo) {
         String trama = "FIN_RIEGO#" + idWS + "#" + volumen + "#" + duracion + "#" + id + "#" + motivo;
         synchronized (finesSinConfirmar) { finesSinConfirmar.put(id, trama); }
@@ -323,7 +362,10 @@ public class WM_WS_M {
 
     // ================================================================ ENGINE
 
-    // Estrategia 4: el ServerSocket nunca se cierra; acepta reconexiones del Engine
+    /**
+     * Acepta conexiones del Engine. El ServerSocket no se cierra nunca: si el Engine se reinicia,
+     * la nueva conexión sustituye a la anterior y se reanudan los HEALTH_CHECK.
+     */
     private void bucleAceptarEngine() {
         try (ServerSocket serverSocket = new ServerSocket(puertoLocalEngine)) {
             System.out.println("[MONITOR] ServerSocket local abierto en puerto " + puertoLocalEngine + " (Esperando a WM_WS_E)...");
@@ -353,7 +395,7 @@ public class WM_WS_M {
         }
     }
 
-    /** Lee todo lo que envía el Engine: respuestas OK/KO, telemetría, fin de riego y peticiones manuales. */
+    /** Lee todo lo que envía el Engine: respuestas OK/KO, telemetría, fin de riego y solicitudes manuales. */
     private void bucleLecturaEngine(Socket s) {
         try {
             DataInputStream entrada = new DataInputStream(s.getInputStream());
@@ -410,11 +452,14 @@ public class WM_WS_M {
         }
     }
 
+    /**
+     * Reenvía a CENTRAL la telemetría del riego autorizado. Si el Engine está regando un riego
+     * que el Monitor no ha autorizado, le ordena parar (una sola vez por riego).
+     */
     private void procesarTelemetria(String id, String caudal, String volumen) {
         boolean descartar = false;
         synchronized (lockRiego) {
             if (!enRiego || !id.equals(riegoId)) {
-                // El Engine riega sin autorización (ej. evento de Kafka antiguo): se le ordena parar
                 descartar = riegosDescartados.add(id);
                 if (!descartar) return;
             } else {
@@ -431,11 +476,13 @@ public class WM_WS_M {
         enviarACentralSeguro("TELEMETRIA#" + idWS + "#" + caudal + "#" + volumen);
     }
 
+    /** El Engine ha cerrado la válvula: se registra el fin para enviarlo a CENTRAL. */
     private void procesarFinRiego(String id, String volumen, String duracion, String motivo) {
         synchronized (lockRiego) {
             if (riegosDescartados.contains(id)) return;
             if (enRiego && id.equals(riegoId)) enRiego = false;
-            if (finRetenido != null && finRetenido[0].equals(id)) finRetenido = null; // el Engine trae el dato exacto
+            // El dato del Engine es exacto: sustituye al que estimó el Monitor al detectar la avería
+            if (finRetenido != null && finRetenido[0].equals(id)) finRetenido = null;
         }
         System.out.println("\n[MONITOR] Riego " + id + " finalizado (" + motivo + ") | Volumen total: " + volumen
                 + " L | Duración: " + duracion + " s");
@@ -447,12 +494,12 @@ public class WM_WS_M {
         return s != null && !s.isClosed();
     }
 
-    /** Envía DATA al Engine empaquetado en trama <STX>DATA<ETX><LRC>. */
+    /** Envía los datos al Engine empaquetados en una trama (no hace nada si no está conectado). */
     private void enviarAEngine(String datos) {
         enviarRawEngine(Protocolo.empaquetar(datos));
     }
 
-    /** Escribe tal cual en el socket del Engine (tramas ya empaquetadas o ACK/NACK). */
+    /** Escribe tal cual en el socket del Engine (una trama ya empaquetada, o un ACK/NACK). */
     private void enviarRawEngine(String contenido) {
         synchronized (lockEngine) {
             if (salidaEngine == null) return;
@@ -478,12 +525,17 @@ public class WM_WS_M {
 
     // ================================================================ SUPERVISIÓN
 
+    /**
+     * Cada segundo: envía HEALTH_CHECK al Engine y evalúa su última respuesta (avería o
+     * recuperación), y controla el riego en curso: envía el INICIO_RIEGO de respaldo si Kafka
+     * no lo entregó y ordena FINALIZAR_RIEGO al cumplirse la duración. Funciona aunque
+     * CENTRAL no esté disponible.
+     */
     private void bucleSupervisionSalud() {
         while (enEjecucion) {
             dormir(INTERVALO_HEALTH_MS);
             long ahora = System.currentTimeMillis();
 
-            // 1. HEALTH_CHECK al Engine y evaluación de la última respuesta
             String fallo = null;
             if (!engineConectado()) {
                 if (engineConectadoAlgunaVez || ahora - arranqueMs > GRACIA_ARRANQUE_MS) fallo = "Engine no conectado";
@@ -502,7 +554,7 @@ public class WM_WS_M {
                 enviarFinRetenido();
             }
 
-            // 2. Control del riego en curso (sigue aunque WM_Central no esté disponible)
+            // Las órdenes se deciden dentro del cerrojo y se envían fuera de él
             boolean enviarRespaldo = false;
             boolean finalizar = false;
             String idRespaldo = null;
@@ -532,12 +584,15 @@ public class WM_WS_M {
         }
     }
 
+    /**
+     * Notifica la avería a CENTRAL (una sola vez hasta que se resuelva) y aborta el riego en curso,
+     * guardando lo regado hasta ese momento (última telemetría) para informar cuando se resuelva.
+     */
     private void reportarAveria(String motivo) {
         if (averiaActiva) return;
         averiaActiva = true;
         System.err.println("\n[MONITOR] ¡ALERTA DE AVERÍA! (" + motivo + "). Notificando FUGA a WM_Central...");
 
-        // Si se estaba regando, se conserva lo regado hasta ahora (última telemetría) para informar al recuperarse
         synchronized (lockRiego) {
             if (enRiego) {
                 long segundos = inicioTelemetriaMs > 0 ? Math.round((System.currentTimeMillis() - inicioTelemetriaMs) / 1000.0) : 0;
@@ -552,7 +607,7 @@ public class WM_WS_M {
         }
     }
 
-    /** Al resolverse la avería: estado final del riego interrumpido (si el Engine no lo envió él mismo). */
+    /** Al resolverse la avería, envía el fin del riego interrumpido si el Engine no lo ha enviado él mismo. */
     private void enviarFinRetenido() {
         String[] fin;
         synchronized (lockRiego) {
@@ -569,6 +624,7 @@ public class WM_WS_M {
         try { Thread.sleep(ms); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
     }
 
+    /** @param args {@code <puerto_para_Engine> <IP_Central> <puerto_Central> <id_WS> [ubicacion]} */
     public static void main(String[] args) {
         if (args.length < 4) {
             System.out.println("Uso: java WM_WS_M <puerto_para_Engine> <IP_Central> <puerto_Central> <id_WS> [ubicacion]");
@@ -579,7 +635,6 @@ public class WM_WS_M {
         String ipCentral = args[1];
         int puertoCentral = Integer.parseInt(args[2]);
         String idWS = args[3];
-        // Sin ubicación: CENTRAL usa la que tiene registrada para esta estación
         String ubicacion = args.length >= 5 ? args[4].trim() : "";
 
         Locale.setDefault(Locale.US);

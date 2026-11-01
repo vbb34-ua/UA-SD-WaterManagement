@@ -1,13 +1,14 @@
-// =====================================================================
-// map.js - Mapa de la ciudad: zonas y estaciones colocadas según su ubicación.
-// =====================================================================
+/** @file Mapa de la ciudad: zonas y estaciones colocadas según su ubicación. */
 
 import { STATUS, subscribe, getState, stationList, select } from './store.js';
 import { esc } from './ui.js';
 
-// Zonas conocidas. cx/cy: centro en fracción del ancho/alto del mapa.
-// r: radio en fracción del lado menor. aliases: nombres de ubicación aceptados
-// (se comparan sin tildes, mayúsculas ni espacios), en inglés y en español.
+/**
+ * Zonas conocidas del mapa.
+ * cx/cy: centro como fracción del ancho/alto del mapa. r: radio como fracción del lado menor.
+ * aliases: nombres de ubicación que corresponden a la zona, en inglés y en español
+ * (se comparan sin tildes, mayúsculas ni espacios).
+ */
 export const ZONES = [
     { key: 'river-park',        name: 'River Park',        cx: 0.14, cy: 0.30, r: 0.22,
       aliases: ['river park', 'parque del rio', 'parque rio'] },
@@ -22,16 +23,19 @@ export const ZONES = [
 /** Nombres de ubicación sugeridos al dar de alta una estación. */
 export const LOCATION_SUGGESTIONS = ['Parque Central', 'Parque del Río', 'Jardines del Río', 'Rotonda Norte'];
 
-// Huecos libres para ubicaciones que no son ninguna de las zonas conocidas
+/** Huecos libres del mapa para ubicaciones que no son ninguna de las zonas conocidas. */
 const EXTRA_SLOTS = [
     { cx: 0.10, cy: 0.80 }, { cx: 0.64, cy: 0.84 }, { cx: 0.42, cy: 0.16 }, { cx: 0.93, cy: 0.20 },
 ];
 const EXTRA_RADIUS = 0.15;
+/** Separación vertical (px) entre las estaciones de una misma zona. */
 const ROW_HEIGHT = 22;
 
+/** Zonas creadas para ubicaciones desconocidas, por ubicación normalizada. */
 const extraZones = {};
 let mapArea;
 
+/** @returns {string} el texto sin tildes, en minúsculas y solo con letras y números */
 function normalize(text) {
     return (text || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/[^a-z0-9]/g, '');
 }
@@ -39,11 +43,15 @@ function normalize(text) {
 const ZONE_BY_ALIAS = {};
 ZONES.forEach(z => z.aliases.forEach(a => { ZONE_BY_ALIAS[normalize(a)] = z; }));
 
+/**
+ * Busca la zona de una ubicación: por nombre exacto, por nombre contenido (p. ej.
+ * "Central Park - Sector B") o, si no es ninguna conocida, una zona extra con su nombre.
+ */
 function zoneFor(location) {
     const loc = normalize(location);
     if (ZONE_BY_ALIAS[loc]) return ZONE_BY_ALIAS[loc];
     for (const alias in ZONE_BY_ALIAS) {
-        if (loc.includes(alias)) return ZONE_BY_ALIAS[alias];   // "Central Park - Sector B"
+        if (loc.includes(alias)) return ZONE_BY_ALIAS[alias];
     }
     const key = loc || 'unassigned';
     if (!extraZones[key]) {
@@ -57,7 +65,7 @@ function zoneFor(location) {
 
 // ---------------------------------------------------------------- RENDER
 
-/** Marcador de una estación: solo el ID y, si riega, el caudal en directo. */
+/** Crea o actualiza el marcador de una estación: su id y, si está regando, el caudal en directo. */
 function renderStation(ws) {
     let el = document.getElementById('st-' + ws.id);
     if (!el) {
@@ -91,6 +99,7 @@ function layout() {
     const ids = new Set(stations.map(s => 'st-' + s.id));
     mapArea.querySelectorAll('.station').forEach(el => { if (!ids.has(el.id)) el.remove(); });
 
+    // Estaciones agrupadas por zona
     const groups = {};
     stations.forEach(ws => {
         const z = zoneFor(ws.location);
@@ -108,7 +117,7 @@ function layout() {
             circle.innerHTML = '<div class="zone-label"></div>';
             mapArea.prepend(circle);
         }
-        // El círculo nunca se sale del mapa
+        // El radio se reduce si el círculo se saldría del mapa
         const cx = z.cx * W, cy = z.cy * H;
         const R = Math.max(40, Math.min(z.r * side, cx - 8, W - cx - 8, cy - 8, H - cy - 8));
         z._R = R;
@@ -119,7 +128,7 @@ function layout() {
         circle.classList.toggle('busy', !!groups[z.key]);
     });
 
-    // Estaciones en columna, centradas en su zona (las etiquetas nunca se solapan)
+    // Estaciones en columna, centradas en su zona, para que sus etiquetas no se solapen
     Object.values(groups).forEach(({ zone, list }) => {
         const R = zone._R;
         list.forEach((ws, i) => {
@@ -136,6 +145,7 @@ function renderLegend() {
         .join('');
 }
 
+/** Dibuja la leyenda y mantiene el mapa al día con el estado de la red. */
 export function initMap() {
     mapArea = document.getElementById('map-area');
     renderLegend();
@@ -146,6 +156,6 @@ export function initMap() {
         else if (change === 'selection') stationList().forEach(renderStation);
     });
 
-    // Se recoloca al cambiar el tamaño o al volver a la pestaña del mapa
+    // Se recoloca al cambiar el tamaño de la ventana o al volver a la pestaña del mapa
     new ResizeObserver(layout).observe(mapArea);
 }

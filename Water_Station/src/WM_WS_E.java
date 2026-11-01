@@ -17,23 +17,28 @@ import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 
 /**
- * WM_WS_E - Engine de la estación de riego.
- * Simula el caudalímetro, el detector de fugas y la electroválvula.
+ * WM_WS_E: Engine de la estación de riego. Simula la electroválvula, el caudalímetro
+ * y el detector de fugas, y ofrece el menú de la estación.
  *
- *  - Socket con su Monitor (WM_WS_M): responde HEALTH_CHECK con OK/KO y le envía
- *    la telemetría (cada segundo) y el fin de riego.
- *  - Kafka (topic wm-eventos): recibe INICIO_RIEGO y ABORTO_RIEGO de su estación.
+ * <ul>
+ *   <li>Socket con su Monitor (WM_WS_M): responde HEALTH_CHECK con OK/KO y le envía
+ *       la telemetría (cada segundo) y el fin de riego.</li>
+ *   <li>Kafka (topic {@value #TOPIC_EVENTOS}): recibe INICIO_RIEGO y ABORTO_RIEGO de su estación.</li>
+ * </ul>
  *
- * Mensajes con el Monitor en tramas <STX>DATA<ETX><LRC> con respuesta ACK/NACK (clase Protocolo).
+ * <p>Válvula a prueba de fallos: si se pierde el enlace con el Monitor, la válvula se cierra
+ * al instante y la estación no admite riegos hasta que el Monitor vuelva.
  *
- * Uso: java WM_WS_E <ip_broker:puerto> <ip_Monitor> <puerto_Monitor> [id_WS]
+ * <p>Los mensajes con el Monitor usan tramas {@link Protocolo} con respuesta ACK/NACK.
+ *
+ * <p>Uso: {@code java WM_WS_E <ip_broker:puerto> <ip_Monitor> <puerto_Monitor> [id_WS]}
  */
 public class WM_WS_E {
 
     private static final String TOPIC_EVENTOS = "wm-eventos";
     /** Eventos de Kafka más antiguos que esto se ignoran (evita reabrir la válvula al reiniciar). */
     private static final long ANTIGUEDAD_MAX_EVENTO_MS = 30000;
-    /** Estrategia 3: si el Monitor no envía nada en este tiempo, se da el enlace por perdido. */
+    /** El Monitor envía HEALTH_CHECK cada segundo: sin nada en este tiempo, el enlace se da por perdido. */
     private static final int TIMEOUT_MONITOR_MS = 5000;
 
     private final String brokerAddress;
@@ -47,11 +52,13 @@ public class WM_WS_E {
     private final Object lockEnvio = new Object();
 
     private volatile boolean valvulaAbierta = false;
+    /** false mientras hay una fuga simulada (tecla K): se responde KO al HEALTH_CHECK. */
     private volatile boolean estadoSaludCorrecto = true;
     private volatile boolean enEjecucion = true;
 
-    // Datos del riego en curso
+    // Riego en curso
     private volatile String riegoActual = null;
+    /** Último riego abierto: si su INICIO_RIEGO llega dos veces (Kafka y socket), se ignora el repetido. */
     private volatile String ultimoRiegoAtendido = null;
     private volatile long inicioRiegoMs = 0;
     private volatile double volumenAcumulado = 0;
@@ -60,6 +67,10 @@ public class WM_WS_E {
     /** FIN_RIEGO que no se pudieron entregar al Monitor (se envían al reconectar). */
     private final List<String> finesPendientes = new ArrayList<>();
 
+    /**
+     * @param brokerAddress dirección host:puerto de Kafka
+     * @param idWS          id de la estación; debe coincidir con el de su Monitor
+     */
     public WM_WS_E(String brokerAddress, String ipMonitor, int puertoMonitor, String idWS) {
         this.brokerAddress = brokerAddress;
         this.ipMonitor = ipMonitor;
@@ -67,17 +78,16 @@ public class WM_WS_E {
         this.idWS = idWS;
     }
 
+    /**
+     * Arranca los hilos de conexión con el Monitor, consumidor de Kafka y caudalímetro, y
+     * ejecuta el menú de la estación en el hilo actual.
+     */
     public void iniciar() {
         System.out.println("=== ARRANCANDO ENGINE (WM_WS_E) - WS ID: " + idWS + " ===");
         System.out.println("[ENGINE] Broker asignado: " + brokerAddress);
 
-        // Estrategia 1: conexión con reintentos al Monitor local
         new Thread(this::gestorConexionMonitor, "Hilo-Conexion-Monitor").start();
-
-        // Estrategia 5: consumidor real de Kafka
         new Thread(this::hiloConsumidorBroker, "Hilo-Kafka-Consumidor").start();
-
-        // Caudalímetro: envía telemetría cada segundo mientras la válvula está abierta
         new Thread(this::hiloCaudalimetro, "Hilo-Caudalimetro").start();
 
         hiloConsolaSimulacion();
@@ -85,7 +95,7 @@ public class WM_WS_E {
 
     // ---------------------------------------------------------------- MONITOR
 
-    // Estrategia 1: reintentos continuos al conectar con el Monitor
+    /** Conecta con el Monitor y atiende sus mensajes; si el enlace se pierde, reintenta cada 2 s. */
     private void gestorConexionMonitor() {
         while (enEjecucion) {
             if (conectarConMonitor()) {
@@ -95,6 +105,7 @@ public class WM_WS_E {
         }
     }
 
+    /** @return true si se ha conectado (y entregado los fines pendientes) */
     private boolean conectarConMonitor() {
         try {
             System.out.println("[ENGINE] Conectando a Monitor local (" + ipMonitor + ":" + puertoMonitor + ")...");
@@ -130,6 +141,10 @@ public class WM_WS_E {
         }
     }
 
+    /**
+     * Atiende los mensajes del Monitor hasta perder el enlace (error o {@value #TIMEOUT_MONITOR_MS} ms
+     * sin recibir nada). Al perderlo cierra la válvula y la estación queda averiada.
+     */
     private void bucleAtencionMonitor() {
         try {
             while (enEjecucion) {
@@ -177,8 +192,7 @@ public class WM_WS_E {
                 } catch (IOException ignored) {}
                 socketMonitor = null;
             }
-            // Estrategia 3: válvula a prueba de fallos (cierre inmediato por seguridad).
-            // Lo regado se guarda y se enviará al Monitor cuando vuelva.
+            // Válvula a prueba de fallos: se cierra al instante; lo regado se enviará al Monitor cuando vuelva
             if (valvulaAbierta) {
                 cerrarValvula("FAIL-SAFE: cierre de emergencia por pérdida de comunicación con el Monitor", "ENLACE");
             }
@@ -196,12 +210,16 @@ public class WM_WS_E {
         return s != null && !s.isClosed();
     }
 
-    /** Envía DATA al Monitor empaquetado en trama <STX>DATA<ETX><LRC>. */
+    /**
+     * Envía los datos al Monitor empaquetados en una trama.
+     *
+     * @return false si el Monitor no está conectado
+     */
     private boolean enviarAMonitor(String datos) {
         return enviarRawMonitor(Protocolo.empaquetar(datos));
     }
 
-    /** Escribe tal cual en el socket del Monitor (tramas ya empaquetadas o ACK/NACK). */
+    /** Escribe tal cual en el socket del Monitor (una trama ya empaquetada, o un ACK/NACK). */
     private boolean enviarRawMonitor(String contenido) {
         synchronized (lockEnvio) {
             if (!monitorConectado()) return false;
@@ -218,9 +236,15 @@ public class WM_WS_E {
 
     // ---------------------------------------------------------------- ELECTROVÁLVULA
 
+    /**
+     * Abre la válvula para el riego indicado, salvo que ya esté abierta, ese riego ya se haya
+     * atendido, haya una fuga o no haya enlace con el Monitor.
+     *
+     * @param origen por dónde llegó la orden (Kafka o el respaldo por socket), solo para mostrarlo
+     */
     private synchronized void abrirValvula(String riegoId, String origen) {
         if (valvulaAbierta) return;
-        if (riegoId != null && riegoId.equals(ultimoRiegoAtendido)) return; // Evento duplicado
+        if (riegoId != null && riegoId.equals(ultimoRiegoAtendido)) return;
         if (!estadoSaludCorrecto) {
             System.err.println("[ENGINE] Riego " + riegoId + " ignorado: la estación tiene una avería (KO).");
             return;
@@ -242,9 +266,12 @@ public class WM_WS_E {
     }
 
     /**
-     * Cierra la válvula e informa SIEMPRE del estado final del riego (volumen y duración) al Monitor,
-     * con su código de motivo: TIEMPO, MANUAL, ABORTADO, AVERIA o ENLACE.
-     * Si el Monitor no está disponible, el fin se guarda y se envía al reconectar: lo regado no se pierde.
+     * Cierra la válvula e informa siempre al Monitor del estado final del riego (FIN_RIEGO con
+     * volumen y duración). Si el Monitor no está disponible, el fin se guarda y se envía al
+     * reconectar, así que lo regado no se pierde. No hace nada si la válvula ya está cerrada.
+     *
+     * @param motivo       texto que se muestra en la consola
+     * @param codigoMotivo TIEMPO, MANUAL, ABORTADO, AVERIA o ENLACE
      */
     private synchronized void cerrarValvula(String motivo, String codigoMotivo) {
         if (!valvulaAbierta) return;
@@ -266,15 +293,18 @@ public class WM_WS_E {
         riegoActual = null;
     }
 
-    /** Simula el caudalímetro: cada segundo mide el caudal y acumula el volumen. */
+    /**
+     * Simula el caudalímetro: mientras la válvula está abierta, cada segundo genera un caudal
+     * de 15 a 25 L/min, acumula el volumen y envía la telemetría al Monitor.
+     */
     private void hiloCaudalimetro() {
         while (enEjecucion) {
             dormir(1000);
             String telemetria = null;
             synchronized (this) {
                 if (valvulaAbierta) {
-                    caudalActual = 15 + random.nextDouble() * 10; // 15-25 L/min
-                    volumenAcumulado += caudalActual / 60.0;      // litros en 1 segundo
+                    caudalActual = 15 + random.nextDouble() * 10;
+                    volumenAcumulado += caudalActual / 60.0; // litros regados en 1 segundo
                     telemetria = String.format(Locale.US, "TELEMETRIA#%s#%.2f#%.2f", riegoActual, caudalActual, volumenAcumulado);
                     long t = (System.currentTimeMillis() - inicioRiegoMs) / 1000;
                     System.out.printf(Locale.US, "[ENGINE] Regando %s | Caudal: %.2f L/min | Volumen: %.2f L | t=%d s%n",
@@ -287,7 +317,11 @@ public class WM_WS_E {
 
     // ---------------------------------------------------------------- KAFKA
 
-    // Estrategia 5: desacoplamiento con Kafka (grupo persistente ws-engine-<idWS>)
+    /**
+     * Consume {@value #TOPIC_EVENTOS} con un grupo propio de la estación ({@code ws-engine-<id>}):
+     * cada Engine recibe todos los eventos y se queda con los de su WS. Si Kafka falla,
+     * reintenta cada 5 s.
+     */
     private void hiloConsumidorBroker() {
         Properties props = new Properties();
         props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, brokerAddress);
@@ -315,8 +349,9 @@ public class WM_WS_E {
         }
     }
 
+    /** Atiende un evento de Kafka si es de esta estación y es reciente. */
     private void procesarEventoKafka(ConsumerRecord<String, String> record) {
-        if (!idWS.equals(record.key()) || record.value() == null) return; // Solo eventos de esta estación
+        if (!idWS.equals(record.key()) || record.value() == null) return;
         if (System.currentTimeMillis() - record.timestamp() > ANTIGUEDAD_MAX_EVENTO_MS) return;
 
         String[] p = record.value().split("#", -1);
@@ -345,6 +380,7 @@ public class WM_WS_E {
         System.out.println("---------------------------------------------");
     }
 
+    /** Lee las órdenes del menú de la estación desde la consola. */
     private void hiloConsolaSimulacion() {
         imprimirMenu();
         try (Scanner scanner = new Scanner(System.in)) {
@@ -354,7 +390,6 @@ public class WM_WS_E {
                     case "K":
                         estadoSaludCorrecto = false;
                         System.err.println("\n>>> [SIMULACIÓN] Fuga detectada. Estado KO: el Monitor reportará FUGA.");
-                        // Si estaba regando, el riego termina inmediatamente (se informa de lo regado)
                         cerrarValvula("Fuga detectada por el sensor", "AVERIA");
                         break;
                     case "O":
@@ -402,6 +437,7 @@ public class WM_WS_E {
         try { Thread.sleep(ms); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
     }
 
+    /** @param args {@code <ip_broker:puerto> <ip_Monitor> <puerto_Monitor> [id_WS]} (id por defecto: WS_01) */
     public static void main(String[] args) {
         if (args.length < 3) {
             System.out.println("Uso: java WM_WS_E <ip_broker:puerto> <ip_Monitor> <puerto_Monitor> [id_WS]");

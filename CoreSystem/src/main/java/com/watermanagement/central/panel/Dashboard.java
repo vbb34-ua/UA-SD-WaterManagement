@@ -1,7 +1,5 @@
 package com.watermanagement.central.panel;
 
-import com.watermanagement.central.logica.GestorRiegos;
-
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.LinkedList;
 import java.util.Map;
@@ -9,15 +7,18 @@ import java.text.SimpleDateFormat;
 import java.util.Date;
 
 /**
- * Estado en memoria del panel de CENTRAL. Cada cambio se imprime en consola
- * y se envía al Dashboard Web (SSE).
+ * Estado en tiempo real de la red que muestra el panel: estado, caudal, volumen y operario de
+ * cada estación, más el historial de eventos. Cada cambio se envía al panel web por SSE
+ * ({@link WebDashboard#broadcast}) y cada evento se imprime también en consola.
  */
 public class Dashboard {
 
+    /** Estados posibles de una estación. */
     public enum Estado {
         DISPONIBLE, REGANDO, FUGA, FUERA_SERVICIO, DESCONECTADA
     }
 
+    /** Datos de una estación tal como los muestra el panel. */
     public static class WSInfo {
         public String id;
         public String location;
@@ -34,6 +35,7 @@ public class Dashboard {
     }
 
     private static final Map<String, WSInfo> estaciones = new ConcurrentHashMap<>();
+    /** Últimos eventos, para enviárselos a los navegadores que se conectan. */
     private static final LinkedList<String> logs = new LinkedList<>();
     private static final int MAX_LOGS = 200;
 
@@ -41,17 +43,20 @@ public class Dashboard {
         log("Sistema CENTRAL iniciado. La interfaz gráfica está en el Dashboard Web.");
     }
 
+    /** Una estación se ha conectado: la muestra con su estado y lo registra en el historial. */
     public static synchronized void registrarEstacion(String id, String location, Estado estado) {
         estaciones.put(id, new WSInfo(id, location, estado));
         log("Alta de WS exitosa: [" + id + "] en [" + location + "] -> " + estado.name());
         WebDashboard.broadcast("ESTADO_ACTUALIZADO", obtenerEstadoJSON());
     }
 
+    /** Añade una estación al panel sin registrar ningún evento (al cargar la BD o al darla de alta). */
     public static synchronized void cargarEstacion(String id, String location, Estado estado) {
         estaciones.put(id, new WSInfo(id, location, estado));
         WebDashboard.broadcast("ESTADO_ACTUALIZADO", obtenerEstadoJSON());
     }
 
+    /** Cambia el estado de una estación; si deja de regar, se ponen a cero su caudal y su operario. */
     public static synchronized void actualizarEstado(String id, Estado estado) {
         WSInfo ws = estaciones.get(id);
         if (ws == null) {
@@ -66,12 +71,16 @@ public class Dashboard {
         WebDashboard.broadcast("ESTADO_ACTUALIZADO", obtenerEstadoJSON());
     }
 
+    /** @return el estado de la estación, o null si no existe */
     public static synchronized Estado getEstado(String id) {
         WSInfo ws = estaciones.get(id);
         return ws == null ? null : ws.estado;
     }
 
-    /** Solo se llama mientras la estación está REGANDO (lo controla GestorRiegos). */
+    /**
+     * Actualiza el caudal y el volumen de un riego en curso. Se envía como evento TELEMETRIA
+     * (solo esa estación) en lugar del estado completo, porque llega cada segundo.
+     */
     public static synchronized void actualizarTelemetria(String id, String caudal, String volumen) {
         WSInfo ws = estaciones.get(id);
         if (ws != null) {
@@ -82,7 +91,7 @@ public class Dashboard {
         }
     }
 
-    /** Al iniciar un riego: asigna operario y reinicia los contadores. */
+    /** Al empezar un riego: asigna el operario a la estación y pone a cero caudal y volumen. */
     public static synchronized void asignarOperario(String id, String operario) {
         WSInfo ws = estaciones.get(id);
         if (ws != null) {
@@ -93,6 +102,10 @@ public class Dashboard {
         }
     }
 
+    /**
+     * Registra un evento con la hora: lo guarda en el historial, lo imprime en consola (las
+     * alertas por la salida de error) y lo envía al panel.
+     */
     public static synchronized void log(String mensaje) {
         String time = new SimpleDateFormat("HH:mm:ss").format(new Date());
         String finalMsg = "[" + time + "] " + mensaje;
@@ -111,6 +124,7 @@ public class Dashboard {
         WebDashboard.broadcast("NUEVO_LOG", "{\"mensaje\":\"" + esc(finalMsg) + "\"}");
     }
 
+    /** @return todas las estaciones como array JSON: {@code [{"id":..,"location":..,"estado":..,...}]} */
     public static synchronized String obtenerEstadoJSON() {
         StringBuilder json = new StringBuilder("[");
         boolean primero = true;
@@ -124,7 +138,7 @@ public class Dashboard {
         return json.toString();
     }
 
-    /** Historial de eventos (para los navegadores que se conectan): ["[hh:mm:ss] msg", ...] */
+    /** @return el historial de eventos como array JSON: {@code ["[hh:mm:ss] mensaje", ...]} */
     public static synchronized String obtenerLogsJSON() {
         StringBuilder json = new StringBuilder("[");
         boolean primero = true;
@@ -136,6 +150,7 @@ public class Dashboard {
         return json.append("]").toString();
     }
 
+    /** @return listado de estaciones en texto, para la respuesta a {@code LISTAR_WS} de un operario */
     public static synchronized String obtenerListadoEstaciones() {
         if (estaciones.isEmpty()) {
             return "No hay estaciones registradas actualmente.";
@@ -153,6 +168,7 @@ public class Dashboard {
         return sb.toString();
     }
 
+    /** Escapa un texto para incluirlo entre comillas en JSON. */
     private static String esc(String s) {
         if (s == null) return "";
         return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", " ");

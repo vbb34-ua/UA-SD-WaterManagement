@@ -1,25 +1,22 @@
-# Ignorar artefactos de compilación local (se compilan dentro del contenedor)
-CoreSystem/target/
+# Contexto de la imagen de WM_Central (Dockerfile raíz): solo hace falta CoreSystem/
 
-# Clases compiladas localmente
+# Compilación local (la imagen compila por su cuenta)
+CoreSystem/target/
 **/*.class
 
-# Bases de datos locales (el contenedor usará su propia BD en /app)
+# Bases de datos locales (en el contenedor la BD está en /app/data)
 **/*.db
 
-# Archivos de IDE y sistema
+# Editores y git
 .vscode/
 .idea/
 *.iml
 .git/
 .gitignore
 
-# PDFs y documentación (no necesarios en imagen)
+# Estaciones y operarios: tienen su propia imagen (Water_Station/Dockerfile)
+Water_Station/
+
+# Documentación
 *.pdf
 README.md
-
-
-# WaterManagement (estaciones) - van en contenedores separados
-WaterManagement/
-sockets_Java/
-test_kafka/

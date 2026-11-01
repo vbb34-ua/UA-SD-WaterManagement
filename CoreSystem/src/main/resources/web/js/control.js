@@ -1,6 +1,4 @@
-// =====================================================================
-// control.js - Vista "Control": órdenes a todas las estaciones y altas.
-// =====================================================================
+/** @file Vista "Control": órdenes a todas las estaciones y altas de estaciones y operarios. */
 
 import { sendAction, registerStation, registerOperator } from './api.js';
 import { showResult, toast } from './ui.js';
@@ -8,6 +6,7 @@ import { LOCATION_SUGGESTIONS } from './map.js';
 
 const $ = id => document.getElementById(id);
 
+/** Envía la orden a todas las estaciones; bloquear todas pide confirmación. */
 async function all(action) {
     if (action === 'BLOCK' && !confirm('Block ALL stations? Any irrigation in progress will be stopped.')) return;
     const dur = action === 'START' ? $('dur-all').value : null;
@@ -37,6 +36,7 @@ async function newOperator() {
     if (result === 'OK') $('new-op-id').value = '';
 }
 
+/** Rellena las ubicaciones sugeridas y conecta los botones de la vista. */
 export function initControl() {
     $('zone-names').innerHTML = LOCATION_SUGGESTIONS.map(n => `<option value="${n}">`).join('');
     $('btn-start-all').addEventListener('click', () => all('START'));

@@ -1,7 +1,7 @@
-// =====================================================================
-// stations.js - Tabla de estaciones (vista "Stations") y listas laterales
-// de la vista "Monitoring" (riegos activos y estaciones que requieren atención).
-// =====================================================================
+/**
+ * @file Tabla de estaciones (vista "Stations") y listas laterales de la vista "Monitoring"
+ * (riegos activos y estaciones que requieren atención).
+ */
 
 import { STATUS, subscribe, getState, stationList, select } from './store.js';
 import { esc, statusPill, dot } from './ui.js';
@@ -11,6 +11,7 @@ let search = '';
 
 // ---------------------------------------------------------------- TABLA
 
+/** @returns {boolean} true si la estación pasa el filtro de estado y la búsqueda (por id o ubicación) */
 function matches(ws) {
     if (statusFilter !== 'ALL' && ws.estado !== statusFilter) return false;
     if (!search) return true;
@@ -49,7 +50,10 @@ function renderFilterChips() {
         </button>`).join('');
 }
 
-/** Usado por los contadores de la cabecera para abrir la tabla filtrada. */
+/**
+ * Filtra la tabla por estado (también lo usan los contadores de la cabecera).
+ * @param {string} status una clave de STATUS, o 'ALL'
+ */
 export function setStatusFilter(status) {
     statusFilter = status;
     renderFilterChips();
@@ -58,6 +62,7 @@ export function setStatusFilter(status) {
 
 // ---------------------------------------------------------------- MONITORING (lateral)
 
+/** @returns {string} HTML de un elemento de las listas laterales */
 function item(ws, valueHtml, sub) {
     return `
     <div class="item" data-id="${esc(ws.id)}">
@@ -88,8 +93,8 @@ function renderSideLists() {
 
 // ---------------------------------------------------------------- INIT
 
+/** Conecta los filtros y la búsqueda, y abre el detalle al pinchar una fila o un elemento de lista. */
 export function initStations() {
-    // Clic en una fila o elemento de lista -> abre el detalle
     const openFrom = e => {
         const row = e.target.closest('[data-id]');
         if (row) select(row.dataset.id);

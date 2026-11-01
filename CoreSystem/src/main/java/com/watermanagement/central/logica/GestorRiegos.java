@@ -10,22 +10,25 @@ import java.util.Locale;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Lógica de negocio de CENTRAL: alta de estaciones/operarios, ciclo de vida de un riego,
- * averías y órdenes de CENTRAL (iniciar / bloquear / activar).
+ * Lógica de negocio de CENTRAL: alta de estaciones y operarios, ciclo de vida de un riego,
+ * averías y órdenes de CENTRAL (iniciar, bloquear y activar).
  *
- * La usan tanto los hilos de sockets (WM_Central_Thread) como el Dashboard Web.
- * Los métodos son synchronized para que las comprobaciones de estado y los cambios
- * sean atómicos (ej. dos operarios pidiendo la misma estación a la vez).
+ * <p>La usan los hilos de sockets ({@link WM_Central_Thread}) y el panel web. Los métodos
+ * públicos son {@code synchronized} para que comprobar un estado y cambiarlo sea atómico
+ * (p. ej. dos operarios pidiendo la misma estación a la vez).
  *
- * Ninguna transacción se pierde:
- *  - Cada riego se guarda en SQLite (tabla riegos) con un id único. La estación envía
- *    FIN_RIEGO con ese id y CENTRAL lo confirma (CONFIRMACION_FIN); la estación lo
- *    reenvía hasta recibir la confirmación, aunque CENTRAL se haya reiniciado.
- *  - Los mensajes para operarios desconectados se guardan en un buzón (SQLite) y se
- *    entregan cuando el operario vuelve a conectarse.
+ * <p>Ninguna transacción se pierde:
+ * <ul>
+ *   <li>Cada riego se guarda en SQLite (tabla {@code riegos}) con un id único. La estación envía
+ *       {@code FIN_RIEGO} con ese id y lo reenvía hasta recibir {@code CONFIRMACION_FIN}, aunque
+ *       CENTRAL se haya reiniciado entretanto.</li>
+ *   <li>Los mensajes para operarios desconectados se guardan en un buzón (SQLite) y se
+ *       entregan cuando el operario vuelve a conectarse.</li>
+ * </ul>
  */
 public class GestorRiegos {
 
+    /** Duración aplicada cuando la solicitud no indica una válida. */
     public static final int DURACION_DEFECTO_S = 15;
     public static final int DURACION_MAX_S = 3600;
     /** Id de operario usado cuando el riego se pide desde el menú de la propia estación. */
@@ -33,10 +36,12 @@ public class GestorRiegos {
     /** Id de operario usado cuando el riego lo inicia CENTRAL desde su panel. */
     public static final String OPERARIO_CENTRAL = "CENTRAL";
 
+    /** Tiempo que una solicitud espera la respuesta del Monitor antes de admitir otra en la misma WS. */
     private static final long TIMEOUT_SOLICITUD_MS = 10000;
     /** Una conexión con actividad más reciente que esto se considera viva (para detectar IDs duplicados). */
     private static final long CONEXION_VIVA_MS = 8000;
 
+    /** Un riego solicitado o en curso. */
     static class Riego {
         final String id;
         final String ws;
@@ -52,7 +57,9 @@ public class GestorRiegos {
         }
     }
 
+    /** Solicitudes enviadas a un Monitor que aún no ha respondido, por id de WS. */
     private static final ConcurrentHashMap<String, Riego> pendientes = new ConcurrentHashMap<>();
+    /** Riegos autorizados y en curso, por id de WS. */
     private static final ConcurrentHashMap<String, Riego> activos = new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<String, WM_Central_Thread> estacionesConectadas = new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<String, WM_Central_Thread> operariosConectados = new ConcurrentHashMap<>();
@@ -61,14 +68,16 @@ public class GestorRiegos {
     // ---------------------------------------------------------------- ALTAS
 
     /**
-     * Alta de una estación. Si el Monitor indica que tiene un riego en curso (riegoEnCurso != null,
-     * formato {id, operario, duracion}) se recupera: pasa por aquí tras una caída de CENTRAL o de la red.
-     * Devuelve null si el alta es correcta o el motivo del rechazo.
+     * Registra la conexión de un Monitor. Solo se admiten estaciones dadas de alta en la BD.
+     * Si el Monitor indica un riego en curso (tras una caída de CENTRAL o de la red), se recupera.
+     *
+     * @param location     ubicación enviada por el Monitor, o null para mantener la de la BD
+     * @param riegoEnCurso {@code {riegoId, operario, duracion}} o null si la estación no está regando
+     * @return null si el alta es correcta, o el motivo del rechazo ({@code WS_NO_REGISTRADA}, {@code ID_EN_USO}...)
      */
     public static synchronized String registrarEstacion(String id, String location, String[] riegoEnCurso,
                                                         WM_Central_Thread hilo) {
         if (!idValido(id)) return "ID_INVALIDO";
-        // Autenticación: solo se admiten estaciones dadas de alta en la red (BD de CENTRAL)
         if (!DatabaseManager.existeEstacion(id)) {
             Dashboard.log("Alta DENEGADA: la WS [" + id + "] no está registrada en CENTRAL.");
             return "WS_NO_REGISTRADA";
@@ -80,13 +89,12 @@ public class GestorRiegos {
                 Dashboard.log("Alta rechazada: ya hay una WS [" + id + "] conectada y activa.");
                 return "ID_EN_USO";
             }
-            // Conexión antigua "zombi" (half-open): la nueva la sustituye
+            // La conexión anterior lleva tiempo sin actividad (socket semiabierto): la nueva la sustituye
             Dashboard.log("WS [" + id + "] se reconecta. Se descarta la conexión anterior.");
             estacionesConectadas.remove(id, anterior);
             anterior.cerrar();
         }
 
-        // location == null: la estación no indica ubicación y se mantiene la de la BD
         String estado = DatabaseManager.registrarEstacion(id, location);
         if (estado == null) return "ERROR_BD";
         if (location == null) location = DatabaseManager.obtenerUbicacion(id);
@@ -100,7 +108,14 @@ public class GestorRiegos {
         return null;
     }
 
-    /** La estación sigue regando tras una caída de CENTRAL o de la red: se vuelve a mostrar REGANDO. */
+    /**
+     * La estación siguió regando durante una caída de CENTRAL o de la red: el riego vuelve a
+     * figurar como ACTIVO y la WS como REGANDO. Si entretanto la WS se bloqueó o el riego ya
+     * constaba como finalizado, se ordena pararlo.
+     *
+     * @param datos {@code {riegoId, operario, duracion}} tal como los envía el Monitor; si el riego
+     *              está en la BD, el operario y la duración se toman de allí
+     */
     private static void recuperarRiegoEnCurso(String ws, String[] datos, WM_Central_Thread hilo) {
         String riegoId = datos[0];
         String[] guardado = DatabaseManager.obtenerRiego(riegoId);
@@ -108,7 +123,7 @@ public class GestorRiegos {
         int duracion = guardado != null ? Integer.parseInt(guardado[3]) : parseEntero(datos[2], DURACION_DEFECTO_S);
 
         if (DatabaseManager.esBloqueada(ws) || (guardado != null && "FINALIZADO".equals(guardado[4]))) {
-            // No se puede continuar: se ordena parar (después del ACK del registro)
+            // La orden de parar se envía después del ACK del registro
             DatabaseManager.guardarRiego(riegoId, ws, operario, duracion, "INTERRUMPIDO");
             hilo.alTerminarRespuesta(() -> hilo.enviarTrama("ABORTAR_RIEGO#La estación está bloqueada por CENTRAL"));
             Dashboard.log("WS [" + ws + "] tenía el riego " + riegoId + " en curso pero está bloqueada: se aborta.");
@@ -128,7 +143,12 @@ public class GestorRiegos {
         }
     }
 
-    /** Alta de una estación nueva en la red desde el panel de CENTRAL. Devuelve null si va bien o el motivo del error. */
+    /**
+     * Da de alta una estación nueva desde el panel de CENTRAL. Queda DESCONECTADA hasta que su Monitor se conecte.
+     *
+     * @param location ubicación (vacía = "Sin ubicación"); el carácter '#' se elimina porque separa campos en las tramas
+     * @return null si el alta es correcta, o el motivo del error para mostrarlo en el panel
+     */
     public static synchronized String altaEstacion(String id, String location) {
         if (!idValido(id)) return "ID inválido (solo letras, números, '_' y '-')";
         if (location == null || location.trim().isEmpty()) location = "Sin ubicación";
@@ -139,7 +159,11 @@ public class GestorRiegos {
         return null;
     }
 
-    /** Alta de un operario nuevo desde el panel de CENTRAL. */
+    /**
+     * Da de alta un operario nuevo desde el panel de CENTRAL.
+     *
+     * @return null si el alta es correcta, o el motivo del error para mostrarlo en el panel
+     */
     public static synchronized String altaOperario(String id) {
         if (!idValido(id)) return "ID inválido (solo letras, números, '_' y '-')";
         if (!DatabaseManager.altaOperario(id)) return "El operario " + id + " ya existe";
@@ -147,6 +171,12 @@ public class GestorRiegos {
         return null;
     }
 
+    /**
+     * Registra la conexión de un operario. Solo se admiten operarios dados de alta en la BD.
+     * Tras el ACK se le entregan los mensajes de su buzón y los riegos suyos que siguen en curso.
+     *
+     * @return null si el registro es correcto, o el motivo del rechazo ({@code OPERARIO_NO_REGISTRADO}, {@code ID_EN_USO}...)
+     */
     public static synchronized String registrarOperario(String id, WM_Central_Thread hilo) {
         if (!idValido(id)) return "ID_INVALIDO";
         if (!DatabaseManager.existeOperario(id)) {
@@ -164,12 +194,14 @@ public class GestorRiegos {
         }
         operariosConectados.put(id, hilo);
         Dashboard.log("Operario [" + id + "] conectado.");
-        // Tras el ACK: mensajes del buzón y servicio en curso
         hilo.alTerminarRespuesta(() -> entregarPendientes(id));
         return null;
     }
 
-    /** Entrega al operario lo que ocurrió mientras estaba desconectado. */
+    /**
+     * Entrega al operario los mensajes de su buzón y le indica sus riegos en curso
+     * ({@code SERVICIO_EN_CURSO}) para que vuelva a seguir su telemetría.
+     */
     private static synchronized void entregarPendientes(String operario) {
         WM_Central_Thread hilo = operariosConectados.get(operario);
         if (hilo == null) return;
@@ -193,6 +225,12 @@ public class GestorRiegos {
         }
     }
 
+    /**
+     * El operario se ha desconectado. Sus riegos continúan y los mensajes que no reciba
+     * quedan en su buzón.
+     *
+     * @param hilo conexión que se cierra; si el operario ya se reconectó por otra, no se hace nada
+     */
     public static synchronized void operarioDesconectado(String id, WM_Central_Thread hilo) {
         if (operariosConectados.remove(id, hilo)) {
             Dashboard.log("Operario [" + id + "] desconectado. Sus riegos continúan; recibirá el resultado al reconectar.");
@@ -200,11 +238,12 @@ public class GestorRiegos {
     }
 
     /**
-     * Estrategias 2 y 3: la estación ha caído (timeout de 15 s, EOF o error de socket).
-     * Si estaba regando se aborta el riego de emergencia.
+     * La conexión con una estación se ha perdido (timeout de 15 s, EOF o error de socket):
+     * pasa a DESCONECTADA y, si estaba regando, el riego se aborta y se avisa al operario.
+     *
+     * @param hilo conexión que se cierra; si la estación ya se reconectó por otra, no se hace nada
      */
     public static synchronized void estacionDesconectada(String id, WM_Central_Thread hilo) {
-        // remove(id, hilo): si la estación ya se reconectó con otro socket, no tocamos su estado
         if (!estacionesConectadas.remove(id, hilo)) return;
 
         Dashboard.log("Caída/Timeout detectado en la conexión de WS [" + id + "].");
@@ -213,8 +252,9 @@ public class GestorRiegos {
     }
 
     /**
-     * La estación ha terminado de reenviar lo que tenía pendiente tras reconectarse.
-     * Los riegos que CENTRAL tenía como ACTIVOS y la estación ya no conoce se dan por interrumpidos.
+     * La estación ha terminado de reenviar lo que tenía pendiente tras reconectarse
+     * ({@code SINCRONIZADO}). Los riegos que la BD tenía como ACTIVOS y la estación ya no
+     * conoce se marcan como INTERRUMPIDOS y se avisa a su operario.
      */
     public static synchronized void estacionSincronizada(String ws) {
         Riego actual = activos.get(ws);
@@ -229,7 +269,14 @@ public class GestorRiegos {
 
     // ---------------------------------------------------------------- RIEGO
 
-    /** Paso 4 de la mecánica: valida la estación y pide autorización a su Monitor. */
+    /**
+     * Comprueba que la estación existe, está DISPONIBLE y conectada, y pide autorización
+     * a su Monitor ({@code SOLICITUD_RIEGO}). El operario recibe cada paso como {@code PROCESANDO:}.
+     *
+     * @param operario id del operario, {@link #OPERARIO_LOCAL} o {@link #OPERARIO_CENTRAL}
+     * @param duracion segundos; si no es válida se usa {@link #DURACION_DEFECTO_S} (máximo {@link #DURACION_MAX_S})
+     * @return null si la solicitud se envió al Monitor, o el motivo de la denegación
+     */
     public static synchronized String solicitarRiego(String ws, String operario, int duracion) {
         duracion = normalizarDuracion(duracion);
         Dashboard.log("Petición de activación para WS [" + ws + "] por [" + operario + "] (" + duracion + " s).");
@@ -258,6 +305,11 @@ public class GestorRiegos {
         return null;
     }
 
+    /**
+     * El Monitor autoriza el riego: pasa a ACTIVO en la BD, la WS a REGANDO y se publica
+     * {@code INICIO_RIEGO} en Kafka, que es la orden para que el Engine abra la válvula.
+     * Si la solicitud ya no es válida (caducada, o la WS cambió de estado), se ordena abortar.
+     */
     public static synchronized void riegoAutorizado(String ws, String riegoId) {
         Riego r = pendientes.get(ws);
         if (r == null || !r.id.equals(riegoId)) {
@@ -281,11 +333,11 @@ public class GestorRiegos {
         Dashboard.asignarOperario(ws, r.operario);
         Dashboard.log("WS [" + ws + "] AUTORIZA el riego de [" + r.operario + "]. Riego en curso (" + r.duracion + " s).");
 
-        // Estrategia 5: el Engine abre la electroválvula al consumir este evento de Kafka
         KafkaManager.publicarEvento("INICIO_RIEGO", ws + "#" + r.operario + "#" + r.duracion + "#" + r.id);
         notificarOperario(r.operario, ws, "AUTORIZADO: El riego ha comenzado en " + ws + " (duración " + r.duracion + " s)", true);
     }
 
+    /** El Monitor rechaza la solicitud (p. ej. Engine averiado): se informa al operario. */
     public static synchronized void riegoDenegado(String ws, String riegoId, String motivo) {
         Riego r = pendientes.get(ws);
         if (r == null || !r.id.equals(riegoId)) return;
@@ -293,17 +345,24 @@ public class GestorRiegos {
         denegar(ws, r.operario, "La estación " + ws + " ha rechazado el riego: " + motivo);
     }
 
+    /**
+     * Telemetría de un riego en curso: se muestra en el panel y se publica en Kafka,
+     * por donde la recibe el operario. Se ignora si el riego ya terminó o se abortó.
+     */
     public static synchronized void telemetria(String ws, String caudal, String volumen) {
         Riego r = activos.get(ws);
-        if (r == null) return; // Telemetría tardía de un riego que ya terminó o se abortó
+        if (r == null) return;
         Dashboard.actualizarTelemetria(ws, caudal, volumen);
-        // Los operarios reciben la telemetría de su WS por Kafka
         KafkaManager.publicarEvento("TELEMETRIA", ws + "#" + r.operario + "#" + caudal + "#" + volumen);
     }
 
     /**
-     * Paso 8: la WS informa del fin de un riego (tiempo, menú, aborto, avería o pérdida de enlace).
-     * Es idempotente: la estación lo reenvía hasta recibir CONFIRMACION_FIN.
+     * La estación informa del fin de un riego: se guarda en la BD, la WS vuelve a DISPONIBLE
+     * (o FUERA_SERVICIO si está bloqueada) y el operario recibe el resumen. Siempre se responde
+     * {@code CONFIRMACION_FIN}; como la estación reenvía hasta recibirla, un fin repetido se ignora.
+     *
+     * @param motivo TIEMPO, MANUAL, ABORTADO, AVERIA o ENLACE, o null si la trama no lo indica
+     * @param hilo   conexión por la que se envía la confirmación
      */
     public static synchronized void finRiego(String ws, String riegoId, String volumenTotal, String duracionS,
                                              String motivo, WM_Central_Thread hilo) {
@@ -318,7 +377,7 @@ public class GestorRiegos {
             } else {
                 String[] guardado = DatabaseManager.obtenerRiego(riegoId);
                 if (guardado == null || "FINALIZADO".equals(guardado[4])) {
-                    return; // Desconocido o ya procesado (reenvío duplicado)
+                    return; // Desconocido o ya procesado: reenvío duplicado
                 }
                 operario = guardado[2];
             }
@@ -341,11 +400,11 @@ public class GestorRiegos {
             KafkaManager.publicarEvento("FIN_RIEGO", ws + "#" + volumenTotal + "#" + duracionS + "#" + riegoId);
             notificarOperario(operario, ws, "RESUMEN_FIN_RIEGO: " + resumen, true);
         } finally {
-            // Siempre se confirma, así la estación deja de reenviarlo
             hilo.enviarTrama("CONFIRMACION_FIN#" + riegoId);
         }
     }
 
+    /** @return el motivo de fin en texto legible para el resumen del operario */
     private static String textoMotivo(String motivo) {
         if (motivo == null) return "Finalizado";
         switch (motivo) {
@@ -360,6 +419,10 @@ public class GestorRiegos {
 
     // ---------------------------------------------------------------- AVERÍAS
 
+    /**
+     * El Monitor detecta una avería en el Engine (fuga o Engine caído): la WS pasa a FUGA y
+     * su riego se aborta. El volumen regado llegará después con el {@code FIN_RIEGO}.
+     */
     public static synchronized void averia(String ws) {
         Dashboard.log("¡ALERTA! Avería/FUGA detectada en WS [" + ws + "].");
         abortarRiego(ws, "Avería detectada en la estación [" + ws
@@ -368,6 +431,7 @@ public class GestorRiegos {
         KafkaManager.publicarEvento("AVERIA", ws);
     }
 
+    /** La avería se ha resuelto: la WS vuelve a DISPONIBLE, o a FUERA_SERVICIO si CENTRAL la tiene bloqueada. */
     public static synchronized void averiaResuelta(String ws) {
         if (!"FUGA".equals(DatabaseManager.obtenerEstado(ws))) return;
         boolean bloq = DatabaseManager.esBloqueada(ws);
@@ -376,20 +440,28 @@ public class GestorRiegos {
         KafkaManager.publicarEvento("RESUELTA", ws);
     }
 
-    // ---------------------------------------------------------------- ÓRDENES DE CENTRAL (punto 11)
+    // ---------------------------------------------------------------- ÓRDENES DE CENTRAL (panel web)
 
-    /** Devuelve null si la solicitud se envió a la estación, o el motivo de la denegación. */
+    /**
+     * Inicia un riego ordenado desde el panel, con las mismas comprobaciones que el de un operario.
+     *
+     * @return null si la solicitud se envió a la estación, o el motivo de la denegación
+     */
     public static synchronized String iniciarDesdeCentral(String ws, int duracion) {
         return solicitarRiego(ws, OPERARIO_CENTRAL, duracion);
     }
 
+    /**
+     * Bloquea la estación (queda bloqueada en la BD aunque CENTRAL se reinicie): aborta su
+     * riego y pasa a FUERA_SERVICIO. No admite riegos hasta que se active.
+     */
     public static synchronized void bloquear(String ws) {
         if (!DatabaseManager.existeEstacion(ws)) return;
         Dashboard.log("CENTRAL bloquea la estación [" + ws + "].");
         DatabaseManager.setBloqueada(ws, true);
         abortarRiego(ws, "La estación [" + ws + "] ha sido bloqueada por CENTRAL", true);
         String estado = DatabaseManager.obtenerEstado(ws);
-        // Si está desconectada o en fuga mantiene ese estado; al conectarse/repararse quedará FUERA_SERVICIO
+        // Si está desconectada o en fuga mantiene ese estado; al conectarse o repararse quedará FUERA_SERVICIO
         if ("DISPONIBLE".equals(estado) || "REGANDO".equals(estado)) {
             cambiarEstado(ws, Dashboard.Estado.FUERA_SERVICIO);
         }
@@ -397,6 +469,7 @@ public class GestorRiegos {
         KafkaManager.publicarEvento("BLOQUEO", ws);
     }
 
+    /** Desbloquea la estación: si estaba FUERA_SERVICIO vuelve a DISPONIBLE. */
     public static synchronized void activar(String ws) {
         if (!DatabaseManager.existeEstacion(ws)) return;
         Dashboard.log("CENTRAL reactiva la estación [" + ws + "].");
@@ -408,14 +481,17 @@ public class GestorRiegos {
         KafkaManager.publicarEvento("ACTIVACION", ws);
     }
 
+    /** Ordena un riego en todas las estaciones; las que no estén disponibles lo deniegan. */
     public static void iniciarTodas(int duracion) {
         for (String ws : DatabaseManager.listarIdsEstaciones()) iniciarDesdeCentral(ws, duracion);
     }
 
+    /** Bloquea todas las estaciones. */
     public static void bloquearTodas() {
         for (String ws : DatabaseManager.listarIdsEstaciones()) bloquear(ws);
     }
 
+    /** Activa todas las estaciones. */
     public static void activarTodas() {
         for (String ws : DatabaseManager.listarIdsEstaciones()) activar(ws);
     }
@@ -423,9 +499,12 @@ public class GestorRiegos {
     // ---------------------------------------------------------------- AUXILIARES
 
     /**
-     * Aborta el riego activo (y/o la solicitud pendiente) de una estación: lo marca como INTERRUMPIDO
-     * en la BD, avisa al operario, publica ABORTO_RIEGO en Kafka y, si se pide, ordena al Monitor cerrar.
-     * El resumen final (volumen regado) llegará después con el FIN_RIEGO de la estación.
+     * Aborta la solicitud pendiente y el riego activo de una estación: el riego queda INTERRUMPIDO
+     * en la BD, se avisa al operario y se publica {@code ABORTO_RIEGO}. El resumen final (volumen
+     * regado) llegará después con el {@code FIN_RIEGO} de la estación.
+     *
+     * @param avisarEstacion true para ordenar al Monitor que cierre la válvula; false si la
+     *                       estación no está conectada o ya la ha cerrado ella misma
      */
     private static void abortarRiego(String ws, String motivo, boolean avisarEstacion) {
         Riego pendiente = pendientes.remove(ws);
@@ -442,20 +521,24 @@ public class GestorRiegos {
         }
     }
 
+    /** Registra la denegación, avisa al operario y devuelve el motivo (para encadenar con {@code return}). */
     private static String denegar(String ws, String operario, String motivo) {
         Dashboard.log("Riego DENEGADO para [" + operario + "] en WS [" + ws + "]: " + motivo);
         notificarOperario(operario, ws, "DENEGADO: " + motivo, true);
         return motivo;
     }
 
+    /** Cambia el estado de la WS en la BD y en el panel. */
     private static void cambiarEstado(String ws, Dashboard.Estado estado) {
         DatabaseManager.actualizarEstado(ws, estado.name());
         Dashboard.actualizarEstado(ws, estado);
     }
 
     /**
-     * Envía un texto al operario. Si el riego se pidió desde la propia WS, se le envía como AVISO.
-     * Si el operario no está conectado (o el envío falla) y guardarSiOffline, va a su buzón.
+     * Envía un texto a quien pidió el riego: al operario, al menú de la estación (como {@code AVISO})
+     * si se pidió desde ella, o a nadie si lo ordenó CENTRAL.
+     *
+     * @param guardarSiOffline true para guardar el texto en el buzón del operario si no se le puede entregar
      */
     private static void notificarOperario(String operario, String ws, String texto, boolean guardarSiOffline) {
         if (OPERARIO_LOCAL.equals(operario)) {
@@ -477,6 +560,7 @@ public class GestorRiegos {
         if (hilo != null) hilo.enviarTrama(trama);
     }
 
+    /** @return la duración limitada a 1..{@link #DURACION_MAX_S}, o {@link #DURACION_DEFECTO_S} si no es positiva */
     private static int normalizarDuracion(int d) {
         if (d <= 0) return DURACION_DEFECTO_S;
         return Math.min(d, DURACION_MAX_S);
@@ -486,6 +570,7 @@ public class GestorRiegos {
         try { return Integer.parseInt(s.trim()); } catch (Exception e) { return defecto; }
     }
 
+    /** IDs de 1 a 32 caracteres: letras, números, '_' y '-' (sin '#', que separa campos en las tramas). */
     private static boolean idValido(String id) {
         return id != null && id.matches("[A-Za-z0-9_\\-]{1,32}");
     }

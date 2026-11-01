@@ -11,11 +11,23 @@ import java.net.BindException;
 import java.net.ServerSocket;
 import java.net.Socket;
 
+/**
+ * Punto de entrada de WM_Central: carga la BD, arranca el panel web y el productor
+ * Kafka y acepta conexiones de Monitores (WM_WS_M) y operarios (WM_FO), cada una
+ * atendida en su propio {@link WM_Central_Thread}.
+ */
 public class WM_Central {
 
+    /**
+     * Arranca CENTRAL. Cada parámetro se toma, por orden de prioridad, del argumento,
+     * de la variable de entorno o del valor por defecto.
+     *
+     * @param args {@code [puerto_sockets] [broker_kafka]}; por defecto SOCKET_PORT o 6000
+     *             y KAFKA_BROKER o localhost:9092. El puerto web se toma de PORT (Railway) o 8080.
+     */
     public static void main(String[] args) {
 
-        // 1. LEER LAS VARIABLES DE ENTORNO DE RAILWAY (Prioridad nube)
+        // Railway puede guardar las variables entre comillas: se limpian
         String envPortWeb = System.getenv("PORT");
         if (envPortWeb != null) envPortWeb = envPortWeb.replace("\"", "").trim();
 
@@ -25,7 +37,6 @@ public class WM_Central {
         String envKafkaBroker = System.getenv("KAFKA_BROKER");
         if (envKafkaBroker != null) envKafkaBroker = envKafkaBroker.replace("\"", "").trim();
 
-        // 2. ASIGNAR PUERTO DE SOCKETS (Prioridad: args[0] > SOCKET_PORT > 6000 por defecto)
         int socketPort = 6000;
         if (args.length > 0 && !args[0].isEmpty()) {
             socketPort = Integer.parseInt(args[0].replace("\"", "").trim());
@@ -33,7 +44,6 @@ public class WM_Central {
             socketPort = Integer.parseInt(envPortSocket);
         }
 
-        // 3. ASIGNAR BROKER KAFKA (Prioridad: args[1] > KAFKA_BROKER > localhost:9092)
         String kafkaBroker = "localhost:9092";
         if (args.length > 1 && !args[1].isEmpty()) {
             kafkaBroker = args[1].replace("\"", "").trim();
@@ -41,11 +51,10 @@ public class WM_Central {
             kafkaBroker = envKafkaBroker;
         }
 
-        // 4. ASIGNAR PUERTO WEB (Railway inyecta PORT dinámicamente)
         int webPort = 8080;
         if (envPortWeb != null && !envPortWeb.isEmpty()) {
             int parsedPort = Integer.parseInt(envPortWeb);
-            // Evitar colisión si Railway asigna PORT igual al socketPort (ej. si leyó EXPOSE 6000)
+            // Railway puede asignar a PORT el puerto de sockets (lo toma del EXPOSE 6000 del Dockerfile)
             if (parsedPort == socketPort) {
                 System.out.println("[WARN] El puerto PORT (" + parsedPort + ") coincide con SOCKET_PORT. Asignando 8080 para Web Dashboard.");
                 webPort = 8080;
@@ -60,27 +69,20 @@ public class WM_Central {
         System.out.println("Kafka Broker:         " + kafkaBroker);
         System.out.println("-------------------------");
 
-        // 3. Inicializar sistema consultando la BD
         DatabaseManager.inicializarYcargarEstaciones();
-
-        // 4. Inicializar el Dashboard UI de terminal
         Dashboard.iniciar();
-        
-        // 5. Iniciar el Dashboard Web pasándole el puerto de Railway
         WebDashboard.iniciar(webPort);
-
-        // 6. Inicializar el productor Kafka pasándole la ruta de Railway
         KafkaManager.inicializar(kafkaBroker);
 
-        // Shutdown hook: cerrar Kafka limpiamente al apagar la JVM
+        // Al apagar la JVM se vacían los eventos pendientes de Kafka
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             Dashboard.log("Apagando servidor CENTRAL...");
             KafkaManager.cerrar();
         }));
 
-        // Bucle de ejecución continuo para mantener el sistema 24/7 (Sockets)
+        // Si el ServerSocket falla (p. ej. puerto ocupado) se vuelve a abrir: CENTRAL no se detiene nunca
         while (true) {
-            try (ServerSocket skServidor = new ServerSocket(socketPort)) { // Usa la variable de entorno
+            try (ServerSocket skServidor = new ServerSocket(socketPort)) {
                 Dashboard.log("Servidor de SOCKETS iniciado. Escuchando el puerto " + socketPort);
                 Dashboard.log("Esperando conexiones de estaciones (WS) y operarios (FO)...");
 
@@ -106,7 +108,6 @@ public class WM_Central {
         }
     }
 
-    // Método auxiliar (mantén el que ya tenías)
     private static void esperar(int milisegundos) {
         try {
             Thread.sleep(milisegundos);

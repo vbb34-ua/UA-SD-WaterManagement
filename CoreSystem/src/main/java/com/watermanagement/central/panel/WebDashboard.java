@@ -20,16 +20,18 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 
 /**
- * Panel web de CENTRAL (HTTP).
- *  - "/"            : ficheros estáticos de src/main/resources/web (index.html, css, js)
- *  - "/events"      : Server-Sent Events con el estado en tiempo real
- *  - "/api/action"  : órdenes de CENTRAL a una WS o a todas (START, BLOCK, ACTIVATE)
- *  - "/api/alta"    : alta de estaciones y operarios
+ * Servidor HTTP del panel web de CENTRAL:
+ * <ul>
+ *   <li>{@code /}: ficheros estáticos de {@code src/main/resources/web} (index.html, css, js)</li>
+ *   <li>{@code /events}: Server-Sent Events con el estado de la red en tiempo real</li>
+ *   <li>{@code /api/action?ws=<id|ALL>&action=<START|BLOCK|ACTIVATE>[&dur=s]}: órdenes de CENTRAL</li>
+ *   <li>{@code /api/alta?tipo=<ws|op>&id=<id>[&loc=ubicación]}: alta de estaciones y operarios</li>
+ * </ul>
  */
 public class WebDashboard {
 
     private static HttpServer server;
-    /** Navegadores conectados esperando eventos en tiempo real. */
+    /** Navegadores conectados a {@code /events}. */
     private static final List<HttpExchange> clientesSSE = new CopyOnWriteArrayList<>();
 
     private static final Map<String, String> TIPOS_MIME = new HashMap<>();
@@ -42,23 +44,25 @@ public class WebDashboard {
         TIPOS_MIME.put("ico", "image/x-icon");
     }
 
+    /**
+     * Arranca el servidor HTTP y el latido de SSE. Si el puerto no está disponible, CENTRAL
+     * sigue funcionando sin panel web.
+     */
     public static void iniciar(int puerto) {
         try {
             server = HttpServer.create(new InetSocketAddress(puerto), 0);
 
-            // 1. Ficheros estáticos del panel (empaquetados dentro del JAR)
             server.createContext("/", WebDashboard::servirEstatico);
 
-            // 2. Server-Sent Events: estado inicial + cambios en tiempo real
             server.createContext("/events", exchange -> {
                 exchange.getResponseHeaders().add("Content-Type", "text/event-stream; charset=UTF-8");
                 exchange.getResponseHeaders().add("Cache-Control", "no-cache");
                 exchange.getResponseHeaders().add("Connection", "keep-alive");
-                exchange.sendResponseHeaders(200, 0); // longitud indefinida
+                exchange.sendResponseHeaders(200, 0); // 0 = longitud indefinida (la conexión queda abierta)
 
-                // Solo a este navegador: estado actual de la red e historial de eventos.
-                // Mismo orden de cerrojos que Dashboard -> broadcast (Dashboard y luego WebDashboard)
-                // para no perder cambios entre el estado inicial y el alta del cliente, sin interbloqueos.
+                // El estado inicial se envía solo a este navegador. Se toman los cerrojos en el mismo
+                // orden que Dashboard -> broadcast (Dashboard y luego WebDashboard): así ningún cambio
+                // se pierde entre el estado inicial y el alta del cliente, y no hay interbloqueos.
                 synchronized (Dashboard.class) {
                     synchronized (WebDashboard.class) {
                         enviar(exchange, "ESTADO_INICIAL", Dashboard.obtenerEstadoJSON());
@@ -69,7 +73,6 @@ public class WebDashboard {
                 System.out.println("[WEB] Nuevo navegador conectado al Dashboard.");
             });
 
-            // 3. Órdenes de CENTRAL (punto 11): a UNA estación (ws=<id>) o a TODAS (ws=ALL)
             server.createContext("/api/action", exchange -> {
                 Map<String, String> p = parametros(exchange);
                 String ws = p.get("ws");
@@ -104,7 +107,6 @@ public class WebDashboard {
                 responderTexto(exchange, respuesta);
             });
 
-            // 4. Altas: /api/alta?tipo=ws&id=WS_11&loc=Plaza Mayor  |  /api/alta?tipo=op&id=FO_11
             server.createContext("/api/alta", exchange -> {
                 Map<String, String> p = parametros(exchange);
                 String tipo = p.get("tipo");
@@ -118,8 +120,8 @@ public class WebDashboard {
             server.setExecutor(Executors.newCachedThreadPool());
             server.start();
 
-            // Latido cada 15 s: mantiene viva la conexión SSE a través de proxies (Railway)
-            // y detecta navegadores que ya se cerraron.
+            // Latido cada 15 s: evita que el proxy de Railway cierre las conexiones SSE inactivas
+            // y detecta los navegadores que ya se cerraron
             Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = new Thread(r, "Hilo-SSE-Latido");
                 t.setDaemon(true);
@@ -134,11 +136,14 @@ public class WebDashboard {
 
     // ---------------------------------------------------------------- FICHEROS ESTÁTICOS
 
+    /**
+     * Sirve un fichero del panel desde el classpath ({@code /web/...}, dentro del JAR).
+     * Solo admite rutas simples, sin "..", para no exponer otros ficheros.
+     */
     private static void servirEstatico(HttpExchange exchange) throws IOException {
         String ruta = exchange.getRequestURI().getPath();
         if (ruta.equals("/")) ruta = "/index.html";
 
-        // Solo rutas simples dentro de /web (sin "..")
         if (ruta.contains("..") || !ruta.matches("[A-Za-z0-9_\\-./]+")) {
             responder(exchange, 400, "text/plain; charset=UTF-8", "Ruta no válida".getBytes(StandardCharsets.UTF_8));
             return;
@@ -157,7 +162,12 @@ public class WebDashboard {
 
     // ---------------------------------------------------------------- SSE
 
-    /** Envía un evento a todos los navegadores conectados. */
+    /**
+     * Envía un evento SSE a todos los navegadores conectados y descarta los que ya no responden.
+     *
+     * @param tipoEvento nombre del evento (ESTADO_ACTUALIZADO, TELEMETRIA, NUEVO_LOG...)
+     * @param datosJSON  datos del evento en JSON
+     */
     public static synchronized void broadcast(String tipoEvento, String datosJSON) {
         List<HttpExchange> caidos = new ArrayList<>();
         for (HttpExchange cliente : clientesSSE) {
@@ -166,6 +176,7 @@ public class WebDashboard {
         quitar(caidos);
     }
 
+    /** Envía un comentario SSE ({@code : ping}), que el navegador ignora, a todos los clientes. */
     private static synchronized void latido() {
         List<HttpExchange> caidos = new ArrayList<>();
         for (HttpExchange cliente : clientesSSE) {
@@ -180,6 +191,7 @@ public class WebDashboard {
         quitar(caidos);
     }
 
+    /** @return false si el navegador se ha desconectado */
     private static boolean enviar(HttpExchange cliente, String tipoEvento, String datosJSON) {
         try {
             OutputStream os = cliente.getResponseBody();
@@ -200,6 +212,7 @@ public class WebDashboard {
 
     // ---------------------------------------------------------------- AUXILIARES
 
+    /** @return los parámetros de la URL ({@code ?clave=valor&...}) ya decodificados */
     private static Map<String, String> parametros(HttpExchange exchange) {
         Map<String, String> p = new HashMap<>();
         String query = exchange.getRequestURI().getRawQuery();
