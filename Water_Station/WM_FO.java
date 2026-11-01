@@ -28,7 +28,11 @@ import org.apache.kafka.clients.consumer.KafkaConsumer;
  * Fichero de servicios: una línea por servicio, "ID_WS" o "ID_WS,segundos" (ej. "WS_01,20").
  * Las líneas vacías o que empiezan por '#' se ignoran.
  *
- * Uso: java WM_FO <ip_broker:puerto> <id_operador> [ip_central] [puerto_central]
+ * Si se indica un fichero de servicios como último parámetro, se ejecuta automáticamente al arrancar
+ * (sin interacción) y después se muestra el menú.
+ * Mensajes con Central en tramas <STX>DATA<ETX><LRC> con respuesta ACK/NACK (clase Protocolo).
+ *
+ * Uso: java WM_FO <ip_broker:puerto> <id_operador> [ip_central] [puerto_central] [fichero_servicios]
  */
 public class WM_FO {
 
@@ -59,16 +63,15 @@ public class WM_FO {
     private String ultimoMensajeConclusion = "";
     private final Object lockServicio = new Object();
 
-    private static final char STX = 0x02;
-    private static final char ETX = 0x03;
-    private static final char ACK = 0x06;
-    private static final char NACK = 0x15;
+    /** Fichero de servicios a ejecutar automáticamente al arrancar (null = solo menú). */
+    private final String ficheroAutomatico;
 
-    public WM_FO(String brokerAddress, String idOperador, String ipCentral, int puertoCentral) {
+    public WM_FO(String brokerAddress, String idOperador, String ipCentral, int puertoCentral, String ficheroAutomatico) {
         this.brokerAddress = brokerAddress;
         this.idOperador = idOperador;
         this.ipCentral = ipCentral;
         this.puertoCentral = puertoCentral;
+        this.ficheroAutomatico = ficheroAutomatico;
     }
 
     public void iniciar() {
@@ -87,6 +90,13 @@ public class WM_FO {
         // Telemetría de la WS en servicio a través de Kafka
         new Thread(this::hiloConsumidorBroker, "Hilo-Kafka-Consumidor").start();
 
+        // Modo automático: ejecuta el fichero de servicios sin interacción y después muestra el menú
+        if (ficheroAutomatico != null) {
+            System.out.println("[MODO AUTOMÁTICO] Esperando conexión con WM_Central para ejecutar '" + ficheroAutomatico + "'...");
+            while (enEjecucion && !registradoEnCentral) dormir(500);
+            procesarFicheroServicios(ficheroAutomatico);
+        }
+
         menuPrincipal();
     }
 
@@ -103,7 +113,7 @@ public class WM_FO {
                 bucleEscuchaCentral(); // Hasta que se pierda la conexión
             }
             if (!enEjecucion) break;
-            System.err.println("[OPERADOR] Reintentando conexión con Central en " + (esperaMs / 1000) + " s...");
+            System.err.println("[OPERADOR] Reintentando conexión con WM_Central en " + (esperaMs / 1000) + " s...");
             dormir(esperaMs);
             esperaMs = Math.min(esperaMs * 2, maxEsperaMs);
         }
@@ -123,7 +133,7 @@ public class WM_FO {
             enviarTrama("REGISTRO_OPERARIO#" + idOperador);
             String respuesta = entradaCentral.readUTF();
 
-            if (respuesta.equals(String.valueOf(ACK))) {
+            if (Protocolo.esAck(respuesta)) {
                 registradoEnCentral = true;
                 System.out.println("[OPERADOR] ¡Registro exitoso en WM_Central! (ACK recibido)");
                 System.out.print("> ");
@@ -139,7 +149,8 @@ public class WM_FO {
             System.err.println("[OPERADOR] Registro rechazado por Central (" + motivo + ").");
             return false;
         } catch (IOException e) {
-            System.err.println("[OPERADOR] Fallo al conectar con WM_Central: " + e.getMessage());
+            System.err.println("[OPERADOR] Imposible conectar con WM_Central (" + ipCentral + ":" + puertoCentral
+                    + "): " + e.getMessage());
             cerrarConexion();
             return false;
         }
@@ -148,9 +159,27 @@ public class WM_FO {
     private void bucleEscuchaCentral() {
         try {
             while (enEjecucion) {
-                String mensaje = entradaCentral.readUTF();
-                if (mensaje.length() == 1 && (mensaje.charAt(0) == ACK || mensaje.charAt(0) == NACK)) {
-                    continue; // Respuestas a PING
+                String trama = entradaCentral.readUTF();
+                if (Protocolo.esAck(trama)) continue;   // Respuesta de Central a una trama nuestra
+                if (Protocolo.esNack(trama)) {
+                    System.err.println("[OPERADOR] WM_Central ha rechazado una trama (NACK"
+                            + (trama.length() > 1 ? ": " + trama.substring(1) : "") + ").");
+                    continue;
+                }
+                String mensaje = Protocolo.desempaquetar(trama);
+                if (mensaje == null) {
+                    System.err.println("[OPERADOR] Trama de WM_Central mal formada o con LRC incorrecto. Respondiendo NACK.");
+                    enviarRaw(Protocolo.S_NACK);
+                    continue;
+                }
+                enviarRaw(Protocolo.S_ACK);
+                if (mensaje.startsWith("SERVICIO_EN_CURSO:")) {
+                    // Tras reconectar: Central indica que una WS sigue regando para este operario
+                    wsEnServicio = mensaje.substring(mensaje.indexOf(':') + 1).trim();
+                    System.out.println("\n>>> [CENTRAL] Su riego en la estación " + wsEnServicio
+                            + " sigue en curso. Mostrando su telemetría.");
+                    System.out.print("> ");
+                    continue;
                 }
                 imprimirMensajeCentral(mensaje);
 
@@ -159,12 +188,16 @@ public class WM_FO {
                 }
             }
         } catch (IOException e) {
-            if (enEjecucion) System.err.println("\n[OPERADOR] Conexión perdida con WM_Central: " + e.getMessage());
+            if (enEjecucion) {
+                System.err.println("\n[OPERADOR] Imposible conectar con WM_Central: conexión perdida (" + e.getMessage() + ").");
+                if (wsEnServicio != null) {
+                    System.err.println("[OPERADOR] El riego en " + wsEnServicio
+                            + " continúa en la estación. Recibirá el resultado al reconectar.");
+                }
+            }
         } finally {
             registradoEnCentral = false;
             cerrarConexion();
-            // Si se esperaba la conclusión de un servicio, no se puede seguir esperando
-            if (wsEnServicio != null) concluirServicio("ERROR: Conexión con CENTRAL perdida durante el servicio");
         }
     }
 
@@ -187,7 +220,7 @@ public class WM_FO {
     private void imprimirMensajeCentral(String msg) {
         String hora = new SimpleDateFormat("HH:mm:ss").format(new Date());
 
-        if (msg.startsWith("AUTORIZADO:")) {
+        if (msg.startsWith("AUTORIZADO:") || msg.startsWith("REANUDADO:")) {
             System.out.println("\n>>> [" + hora + "] [CENTRAL - ÉXITO] " + msg);
         } else if (msg.startsWith("DENEGADO:") || msg.startsWith("ERROR:") || msg.startsWith("ABORTADO:")) {
             System.err.println("\n>>> [" + hora + "] [CENTRAL - AVISO/ERROR] " + msg);
@@ -205,19 +238,27 @@ public class WM_FO {
         System.out.print("> ");
     }
 
+    /** Envía DATA a Central empaquetado en trama <STX>DATA<ETX><LRC>. */
     private void enviarTrama(String datos) throws IOException {
         synchronized (lockEnvio) {
             if (salidaCentral == null || socketCentral == null || socketCentral.isClosed()) {
                 throw new IOException("Socket no disponible");
             }
-            String mensaje = STX + datos + ETX;
-            char lrc = 0;
-            for (int i = 0; i < mensaje.length(); i++) {
-                lrc ^= mensaje.charAt(i);
-            }
-            salidaCentral.writeUTF(mensaje + lrc);
+            salidaCentral.writeUTF(Protocolo.empaquetar(datos));
             salidaCentral.flush();
             ultimoEnvioMs = System.currentTimeMillis();
+        }
+    }
+
+    /** Envía un ACK/NACK a Central. */
+    private void enviarRaw(String contenido) {
+        synchronized (lockEnvio) {
+            try {
+                if (salidaCentral != null && socketCentral != null && !socketCentral.isClosed()) {
+                    salidaCentral.writeUTF(contenido);
+                    salidaCentral.flush();
+                }
+            } catch (IOException ignored) {}
         }
     }
 
@@ -287,7 +328,7 @@ public class WM_FO {
             return true;
         } catch (IOException e) {
             wsEnServicio = null;
-            System.err.println("[OPERADOR] Error al solicitar activación (Sin conexión con Central): " + e.getMessage());
+            System.err.println("[OPERADOR] Imposible conectar con WM_Central: la solicitud de riego no se ha enviado.");
             return false;
         }
     }
@@ -362,7 +403,7 @@ public class WM_FO {
         try {
             enviarTrama("LISTAR_WS#" + idOperador);
         } catch (IOException e) {
-            System.err.println("[OPERADOR] Error al consultar estaciones: " + e.getMessage());
+            System.err.println("[OPERADOR] Imposible conectar con WM_Central: no se pueden consultar las estaciones.");
         }
     }
 
@@ -432,7 +473,7 @@ public class WM_FO {
 
     public static void main(String[] args) {
         if (args.length < 2) {
-            System.out.println("Uso: java WM_FO <ip_broker:puerto> <id_operador> [ip_central] [puerto_central]");
+            System.out.println("Uso: java WM_FO <ip_broker:puerto> <id_operador> [ip_central] [puerto_central] [fichero_servicios]");
             System.exit(1);
         }
 
@@ -440,10 +481,12 @@ public class WM_FO {
         String idOperador = args[1];
         String ipCentral = "localhost";
         int puertoCentral = 6000;
+        String fichero = null;
 
         if (args.length >= 4) {
             ipCentral = args[2];
             puertoCentral = Integer.parseInt(args[3]);
+            if (args.length >= 5 && !args[4].trim().isEmpty()) fichero = args[4].trim();
         } else if (args.length == 3) {
             if (args[2].contains(":")) {
                 String[] partes = args[2].split(":");
@@ -454,6 +497,6 @@ public class WM_FO {
             }
         }
 
-        new WM_FO(broker, idOperador, ipCentral, puertoCentral).iniciar();
+        new WM_FO(broker, idOperador, ipCentral, puertoCentral, fichero).iniciar();
     }
 }

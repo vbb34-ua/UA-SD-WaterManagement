@@ -3,7 +3,9 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.Socket;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.List;
 import java.util.Locale;
 import java.util.Properties;
 import java.util.Random;
@@ -21,6 +23,8 @@ import org.apache.kafka.clients.consumer.KafkaConsumer;
  *  - Socket con su Monitor (WM_WS_M): responde HEALTH_CHECK con OK/KO y le envía
  *    la telemetría (cada segundo) y el fin de riego.
  *  - Kafka (topic wm-eventos): recibe INICIO_RIEGO y ABORTO_RIEGO de su estación.
+ *
+ * Mensajes con el Monitor en tramas <STX>DATA<ETX><LRC> con respuesta ACK/NACK (clase Protocolo).
  *
  * Uso: java WM_WS_E <ip_broker:puerto> <ip_Monitor> <puerto_Monitor> [id_WS]
  */
@@ -53,6 +57,8 @@ public class WM_WS_E {
     private volatile double volumenAcumulado = 0;
     private volatile double caudalActual = 0;
     private final Random random = new Random();
+    /** FIN_RIEGO que no se pudieron entregar al Monitor (se envían al reconectar). */
+    private final List<String> finesPendientes = new ArrayList<>();
 
     public WM_WS_E(String brokerAddress, String ipMonitor, int puertoMonitor, String idWS) {
         this.brokerAddress = brokerAddress;
@@ -99,18 +105,47 @@ public class WM_WS_E {
                 entradaMonitor = new DataInputStream(s.getInputStream());
                 socketMonitor = s;
             }
-            System.out.println("[ENGINE] Conectado exitosamente al Monitor.");
+            System.out.println("[ENGINE] Conectado exitosamente al Monitor. Estación operativa.");
+            enviarFinesPendientes();
             return true;
         } catch (IOException e) {
-            System.err.println("[ENGINE] No se pudo conectar con el Monitor: " + e.getMessage() + ". Reintentando en 2 s...");
+            System.err.println("[ENGINE] ESTACIÓN AVERIADA: no se puede conectar con el Monitor (" + e.getMessage()
+                    + "). No se admiten riegos. Reintentando en 2 s...");
             return false;
+        }
+    }
+
+    /** Entrega al Monitor los fines de riego que quedaron pendientes por pérdida de enlace. */
+    private void enviarFinesPendientes() {
+        List<String> copia;
+        synchronized (finesPendientes) {
+            copia = new ArrayList<>(finesPendientes);
+            finesPendientes.clear();
+        }
+        for (String fin : copia) {
+            System.out.println("[ENGINE] Enviando al Monitor el estado final pendiente: " + fin);
+            if (!enviarAMonitor(fin)) {
+                synchronized (finesPendientes) { finesPendientes.add(fin); }
+            }
         }
     }
 
     private void bucleAtencionMonitor() {
         try {
             while (enEjecucion) {
-                String mensaje = entradaMonitor.readUTF();
+                String trama = entradaMonitor.readUTF();
+                if (Protocolo.esAck(trama)) continue;
+                if (Protocolo.esNack(trama)) {
+                    System.err.println("[ENGINE] El Monitor ha rechazado una trama (NACK).");
+                    continue;
+                }
+                String mensaje = Protocolo.desempaquetar(trama);
+                if (mensaje == null) {
+                    System.err.println("[ENGINE] Trama del Monitor mal formada o con LRC incorrecto. Respondiendo NACK.");
+                    enviarRawMonitor(Protocolo.S_NACK);
+                    continue;
+                }
+                enviarRawMonitor(Protocolo.S_ACK);
                 String[] partes = mensaje.split("#", -1);
 
                 switch (partes[0]) {
@@ -121,10 +156,10 @@ public class WM_WS_E {
                         abrirValvula(partes.length > 1 ? partes[1] : null, "Monitor (respaldo por socket)");
                         break;
                     case "ABORTAR_RIEGO":
-                        cerrarValvula("ABORTADO: " + (partes.length > 1 ? partes[1] : "orden del Monitor"), false);
+                        cerrarValvula("ABORTADO: " + (partes.length > 1 ? partes[1] : "orden del Monitor"), "ABORTADO");
                         break;
                     case "FINALIZAR_RIEGO":
-                        cerrarValvula("Tiempo de riego alcanzado", true);
+                        cerrarValvula("Tiempo de riego alcanzado", "TIEMPO");
                         break;
                     case "AVISO":
                         System.out.println("\n>>> [AVISO CENTRAL] " + (partes.length > 1 ? partes[1] : ""));
@@ -135,16 +170,23 @@ public class WM_WS_E {
             }
         } catch (IOException e) {
             System.err.println("\n[ENGINE] ¡ALERTA! Pérdida de enlace con el Monitor local: " + e.getMessage());
-            // Estrategia 3: válvula a prueba de fallos (cierre inmediato por seguridad)
-            if (valvulaAbierta) {
-                cerrarValvula("FAIL-SAFE: cierre de emergencia por pérdida de comunicación con el Monitor", false);
-            }
         } finally {
             synchronized (lockEnvio) {
                 try {
                     if (socketMonitor != null) socketMonitor.close();
                 } catch (IOException ignored) {}
                 socketMonitor = null;
+            }
+            // Estrategia 3: válvula a prueba de fallos (cierre inmediato por seguridad).
+            // Lo regado se guarda y se enviará al Monitor cuando vuelva.
+            if (valvulaAbierta) {
+                cerrarValvula("FAIL-SAFE: cierre de emergencia por pérdida de comunicación con el Monitor", "ENLACE");
+            }
+            if (enEjecucion) {
+                System.err.println("==============================================");
+                System.err.println(">>> [ENGINE] ESTACIÓN AVERIADA: Monitor no disponible.");
+                System.err.println("    No se admiten riegos (ni manuales) hasta que el Monitor vuelva.");
+                System.err.println("==============================================");
             }
         }
     }
@@ -154,14 +196,22 @@ public class WM_WS_E {
         return s != null && !s.isClosed();
     }
 
-    private void enviarAMonitor(String mensaje) {
+    /** Envía DATA al Monitor empaquetado en trama <STX>DATA<ETX><LRC>. */
+    private boolean enviarAMonitor(String datos) {
+        return enviarRawMonitor(Protocolo.empaquetar(datos));
+    }
+
+    /** Escribe tal cual en el socket del Monitor (tramas ya empaquetadas o ACK/NACK). */
+    private boolean enviarRawMonitor(String contenido) {
         synchronized (lockEnvio) {
-            if (!monitorConectado()) return;
+            if (!monitorConectado()) return false;
             try {
-                salidaMonitor.writeUTF(mensaje);
+                salidaMonitor.writeUTF(contenido);
                 salidaMonitor.flush();
+                return true;
             } catch (IOException e) {
                 System.err.println("[ENGINE] Error enviando al Monitor: " + e.getMessage());
+                return false;
             }
         }
     }
@@ -176,7 +226,7 @@ public class WM_WS_E {
             return;
         }
         if (!monitorConectado()) {
-            System.err.println("[ENGINE] Riego " + riegoId + " ignorado: no hay enlace con el Monitor (fail-safe).");
+            System.err.println("[ENGINE] Riego " + riegoId + " ignorado: ESTACIÓN AVERIADA (sin enlace con el Monitor).");
             return;
         }
         riegoActual = riegoId;
@@ -191,8 +241,12 @@ public class WM_WS_E {
         System.out.println("==============================================");
     }
 
-    /** Cierra la válvula. Si notificarFin, informa del fin del riego (volumen y duración) al Monitor. */
-    private synchronized void cerrarValvula(String motivo, boolean notificarFin) {
+    /**
+     * Cierra la válvula e informa SIEMPRE del estado final del riego (volumen y duración) al Monitor,
+     * con su código de motivo: TIEMPO, MANUAL, ABORTADO, AVERIA o ENLACE.
+     * Si el Monitor no está disponible, el fin se guarda y se envía al reconectar: lo regado no se pierde.
+     */
+    private synchronized void cerrarValvula(String motivo, String codigoMotivo) {
         if (!valvulaAbierta) return;
         valvulaAbierta = false;
         long duracionS = Math.round((System.currentTimeMillis() - inicioRiegoMs) / 1000.0);
@@ -204,8 +258,10 @@ public class WM_WS_E {
         System.out.println("    Volumen total: " + volumen + " L | Duración: " + duracionS + " s");
         System.out.println("==============================================");
 
-        if (notificarFin) {
-            enviarAMonitor("FIN_RIEGO#" + volumen + "#" + duracionS);
+        String fin = "FIN_RIEGO#" + volumen + "#" + duracionS + "#" + riegoActual + "#" + codigoMotivo;
+        if (!enviarAMonitor(fin)) {
+            synchronized (finesPendientes) { finesPendientes.add(fin); }
+            System.err.println("[ENGINE] Monitor no disponible: el estado final del riego se enviará al reconectar.");
         }
         riegoActual = null;
     }
@@ -219,7 +275,7 @@ public class WM_WS_E {
                 if (valvulaAbierta) {
                     caudalActual = 15 + random.nextDouble() * 10; // 15-25 L/min
                     volumenAcumulado += caudalActual / 60.0;      // litros en 1 segundo
-                    telemetria = String.format(Locale.US, "TELEMETRIA#%.2f#%.2f", caudalActual, volumenAcumulado);
+                    telemetria = String.format(Locale.US, "TELEMETRIA#%s#%.2f#%.2f", riegoActual, caudalActual, volumenAcumulado);
                     long t = (System.currentTimeMillis() - inicioRiegoMs) / 1000;
                     System.out.printf(Locale.US, "[ENGINE] Regando %s | Caudal: %.2f L/min | Volumen: %.2f L | t=%d s%n",
                             idWS, caudalActual, volumenAcumulado, t);
@@ -269,7 +325,7 @@ public class WM_WS_E {
                 abrirValvula(p.length > 4 ? p[4] : null, "Kafka (operario " + (p.length > 2 ? p[2] : "?") + ")");
                 break;
             case "ABORTO_RIEGO": // ABORTO_RIEGO#ws#motivo
-                cerrarValvula("ABORTADO (Kafka): " + (p.length > 2 ? p[2] : ""), false);
+                cerrarValvula("ABORTADO (Kafka): " + (p.length > 2 ? p[2] : ""), "ABORTADO");
                 break;
             default:
                 break;
@@ -298,8 +354,8 @@ public class WM_WS_E {
                     case "K":
                         estadoSaludCorrecto = false;
                         System.err.println("\n>>> [SIMULACIÓN] Fuga detectada. Estado KO: el Monitor reportará FUGA.");
-                        // Si estaba regando, el riego termina inmediatamente
-                        cerrarValvula("Fuga detectada por el sensor", false);
+                        // Si estaba regando, el riego termina inmediatamente (se informa de lo regado)
+                        cerrarValvula("Fuga detectada por el sensor", "AVERIA");
                         break;
                     case "O":
                         estadoSaludCorrecto = true;
@@ -311,7 +367,9 @@ public class WM_WS_E {
                             try { seg = Integer.parseInt(cmd[1]); } catch (NumberFormatException ignored) {}
                         }
                         if (!monitorConectado()) {
-                            System.err.println("[ENGINE] No hay conexión con el Monitor. No se puede solicitar el riego.");
+                            System.err.println("[ENGINE] ESTACIÓN AVERIADA (Monitor no disponible): no se admiten riegos.");
+                        } else if (!estadoSaludCorrecto) {
+                            System.err.println("[ENGINE] ESTACIÓN AVERIADA (fuga activa): no se admiten riegos.");
                         } else {
                             enviarAMonitor("SOLICITUD_MANUAL#" + seg);
                             System.out.println("[ENGINE] Solicitud de riego manual enviada a CENTRAL"
@@ -319,13 +377,14 @@ public class WM_WS_E {
                         }
                         break;
                     case "F":
-                        if (valvulaAbierta) cerrarValvula("Riego finalizado manualmente desde el menú", true);
+                        if (valvulaAbierta) cerrarValvula("Riego finalizado manualmente desde el menú", "MANUAL");
                         else System.out.println("[ENGINE] No hay ningún riego en curso.");
                         break;
                     case "E":
-                        System.out.printf(Locale.US, "[ENGINE] Salud: %s | Monitor: %s | Válvula: %s | Volumen: %.2f L%n",
+                        System.out.printf(Locale.US, "[ENGINE] Estación: %s | Salud: %s | Monitor: %s | Válvula: %s | Volumen: %.2f L%n",
+                                (monitorConectado() && estadoSaludCorrecto) ? "OPERATIVA" : "AVERIADA",
                                 estadoSaludCorrecto ? "OK" : "KO",
-                                monitorConectado() ? "conectado" : "desconectado",
+                                monitorConectado() ? "conectado" : "DESCONECTADO",
                                 valvulaAbierta ? "ABIERTA (riego " + riegoActual + ")" : "CERRADA",
                                 volumenAcumulado);
                         break;

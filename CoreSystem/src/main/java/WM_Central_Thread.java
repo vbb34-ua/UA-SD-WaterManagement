@@ -9,8 +9,9 @@ import java.net.SocketTimeoutException;
  * Hilo que atiende una conexión de socket con CENTRAL: un Monitor de WS (WM_WS_M)
  * o una aplicación de operario (WM_FO).
  *
- * Protocolo: <STX>CODIGO#campo1#...#campoN<ETX><LRC>, LRC = XOR de todos los bytes
- * desde STX hasta ETX. CENTRAL responde con <ACK> o <NACK>.
+ * Protocolo (en ambos sentidos): <STX>CODIGO#campo1#...#campoN<ETX><LRC>,
+ * LRC = XOR de todos los caracteres desde STX hasta ETX. Quien recibe una trama
+ * responde <ACK> si es correcta o <NACK>[motivo] si no lo es.
  */
 public class WM_Central_Thread extends Thread {
 
@@ -38,24 +39,37 @@ public class WM_Central_Thread extends Thread {
 
     // ---------------------------------------------------------------- E/S
 
-    private synchronized void escribeSocket(String datos) {
+    /** Acción a ejecutar justo después de enviar la respuesta (ACK) de la operación actual. */
+    private Runnable trasRespuesta = null;
+
+    private synchronized boolean escribeSocket(String datos) {
         try {
             salida.writeUTF(datos);
             salida.flush();
+            return true;
         } catch (Exception e) {
             System.out.println("Error escribiendo en socket [" + idConexion + "]: " + e.getMessage());
+            return false;
         }
     }
 
     /** Trama con formato STX/ETX/LRC (hacia los Monitores). */
-    public void enviarTrama(String datos) {
+    public boolean enviarTrama(String datos) {
         String mensaje = STX + datos + ETX;
-        escribeSocket(mensaje + calcularLRC(mensaje));
+        return escribeSocket(mensaje + calcularLRC(mensaje));
     }
 
-    /** Texto plano informativo (hacia las aplicaciones de operario). */
-    public void enviarTexto(String texto) {
-        escribeSocket(texto);
+    /** Mensaje informativo para un operario, también en trama STX/ETX/LRC. Devuelve false si no se pudo enviar. */
+    public boolean enviarTexto(String texto) {
+        return enviarTrama(texto);
+    }
+
+    /**
+     * Programa una acción para después del ACK (ej. entregar el buzón tras el registro),
+     * para que el cliente no reciba otros mensajes antes de la respuesta a su registro.
+     */
+    public void alTerminarRespuesta(Runnable accion) {
+        this.trasRespuesta = accion;
     }
 
     public long msDesdeUltimaActividad() {
@@ -110,11 +124,13 @@ public class WM_Central_Thread extends Thread {
                 return ack();
 
             // ---------------- Mensajes de los MONITORES (WM_WS_M)
-            case "REGISTRO": {
+            case "REGISTRO": { // REGISTRO#id#ubicacion[#riegoId#operario#duracion si tiene un riego en curso]
                 if (partes.length < 3 || tipo == Tipo.OPERARIO) return nack("FORMATO");
                 String id = partes[1].trim();
-                String location = partes[2].trim().isEmpty() ? "Sin ubicación" : partes[2].trim();
-                String error = GestorRiegos.registrarEstacion(id, location, this);
+                String location = partes[2].trim().isEmpty() ? null : partes[2].trim(); // vacía: la de la BD
+                String[] riegoEnCurso = (partes.length >= 6 && !partes[3].isEmpty())
+                        ? new String[] { partes[3], partes[4], partes[5] } : null;
+                String error = GestorRiegos.registrarEstacion(id, location, riegoEnCurso, this);
                 if (error != null) return nack(error);
                 this.tipo = Tipo.ESTACION;
                 this.idConexion = id;
@@ -135,9 +151,15 @@ public class WM_Central_Thread extends Thread {
                 GestorRiegos.telemetria(idConexion, partes[2], partes[3]);
                 return ack();
 
-            case "FIN_RIEGO":
-                if (tipo != Tipo.ESTACION || partes.length < 4) return nack("NO_REGISTRADO");
-                GestorRiegos.finRiego(idConexion, partes[2], partes[3]);
+            case "FIN_RIEGO": // FIN_RIEGO#ws#volumen#duracion#riegoId#motivo
+                if (tipo != Tipo.ESTACION || partes.length < 5) return nack("NO_REGISTRADO");
+                GestorRiegos.finRiego(idConexion, partes[4], partes[2], partes[3],
+                        partes.length >= 6 ? partes[5] : null, this);
+                return ack();
+
+            case "SINCRONIZADO": // La estación ha reenviado todo lo pendiente tras reconectarse
+                if (tipo != Tipo.ESTACION) return nack("NO_REGISTRADO");
+                GestorRiegos.estacionSincronizada(idConexion);
                 return ack();
 
             case "AVERIA":
@@ -174,11 +196,11 @@ public class WM_Central_Thread extends Thread {
                 // El operario siempre es el de la sesión (no se puede pedir en nombre de otro)
                 GestorRiegos.solicitarRiego(partes[1].trim(), idConexion,
                         partes.length >= 4 ? parseEntero(partes[3], 0) : 0);
-                return null;
+                return ack();
 
             case "LISTAR_WS":
                 enviarTexto("LISTA_ESTACIONES:" + Dashboard.obtenerListadoEstaciones());
-                return null;
+                return ack();
         }
 
         return nack("OPERACION_DESCONOCIDA");
@@ -198,10 +220,22 @@ public class WM_Central_Thread extends Thread {
                 String cadena = entrada.readUTF();
                 ultimaActividadMs = System.currentTimeMillis();
 
+                // ACK/NACK del cliente a una trama enviada por CENTRAL: no se responden
+                if (cadena.length() == 1 && cadena.charAt(0) == ACK) continue;
+                if (cadena.length() >= 1 && cadena.charAt(0) == NACK) {
+                    System.err.println("[CENTRAL] [" + idConexion + "] ha rechazado una trama (NACK): LRC o formato incorrecto.");
+                    continue;
+                }
+
                 String data = procesarTrama(cadena);
                 String respuesta = (data != null) ? ejecutarOperacion(data) : nack("TRAMA_INVALIDA");
                 if (respuesta != null) {
                     escribeSocket(respuesta);
+                }
+                if (trasRespuesta != null) {
+                    Runnable accion = trasRespuesta;
+                    trasRespuesta = null;
+                    accion.run();
                 }
             }
         } catch (SocketTimeoutException te) {

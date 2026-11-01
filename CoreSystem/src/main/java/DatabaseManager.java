@@ -44,6 +44,14 @@ public class DatabaseManager {
         "FO_01", "FO_02", "FO_03", "FO_04", "FO_05", "FO_06", "FO_07", "FO_08", "FO_09", "FO_10"
     };
 
+    // Estaciones dadas de alta por defecto en la red: {id, ubicación}
+    private static final String[][] ESTACIONES_INICIALES = {
+        {"WS_01", "Parque Central"}, {"WS_02", "Jardines del Río"}, {"WS_03", "Parque del Río"},
+        {"WS_04", "Rotonda Norte"},  {"WS_05", "Parque Central"},   {"WS_06", "Jardines del Río"},
+        {"WS_07", "Parque del Río"}, {"WS_08", "Rotonda Norte"},    {"WS_09", "Parque Central"},
+        {"WS_10", "Jardines del Río"}
+    };
+
     public static synchronized void inicializarYcargarEstaciones() {
         try {
             Class.forName("org.sqlite.JDBC");
@@ -65,6 +73,26 @@ public class DatabaseManager {
                         + " id TEXT PRIMARY KEY,"
                         + " nombre TEXT"
                         + ");");
+                // Historial de riegos: permite terminar/resumir un riego aunque CENTRAL se reinicie
+                stmt.execute("CREATE TABLE IF NOT EXISTS riegos ("
+                        + " id TEXT PRIMARY KEY,"
+                        + " ws TEXT NOT NULL,"
+                        + " operario TEXT NOT NULL,"
+                        + " duracion INTEGER NOT NULL,"
+                        + " estado TEXT NOT NULL,"          // ACTIVO | INTERRUMPIDO | FINALIZADO
+                        + " volumen TEXT,"
+                        + " duracion_real TEXT,"
+                        + " motivo_fin TEXT,"
+                        + " inicio TEXT DEFAULT CURRENT_TIMESTAMP,"
+                        + " fin TEXT"
+                        + ");");
+                // Buzón: mensajes para operarios que estaban desconectados
+                stmt.execute("CREATE TABLE IF NOT EXISTS mensajes_pendientes ("
+                        + " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                        + " operario TEXT NOT NULL,"
+                        + " texto TEXT NOT NULL,"
+                        + " creado TEXT DEFAULT CURRENT_TIMESTAMP"
+                        + ");");
             }
 
             // Migración: BDs antiguas no tenían la columna 'bloqueada'
@@ -78,6 +106,14 @@ public class DatabaseManager {
                 for (String op : OPERARIOS_INICIALES) {
                     ps.setString(1, op);
                     ps.setString(2, "Operario " + op);
+                    ps.executeUpdate();
+                }
+            }
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "INSERT OR IGNORE INTO watering_stations (id, location, status, bloqueada) VALUES (?, ?, 'DESCONECTADA', 0)")) {
+                for (String[] ws : ESTACIONES_INICIALES) {
+                    ps.setString(1, ws[0]);
+                    ps.setString(2, ws[1]);
                     ps.executeUpdate();
                 }
             }
@@ -115,20 +151,26 @@ public class DatabaseManager {
     }
 
     /**
-     * Da de alta (o actualiza) una estación. Devuelve el estado con el que queda:
-     * FUERA_SERVICIO si estaba bloqueada por CENTRAL, DISPONIBLE en otro caso. Null si falla.
+     * Autenticación de una estación YA dada de alta. Si location no es null, actualiza su ubicación.
+     * Devuelve el estado con el que queda (FUERA_SERVICIO si está bloqueada, DISPONIBLE si no)
+     * o null si falla.
      */
     public static synchronized String registrarEstacion(String id, String location) {
         boolean bloq = esBloqueada(id);
         String estado = bloq ? "FUERA_SERVICIO" : "DISPONIBLE";
-        String sql = "INSERT INTO watering_stations (id, location, status, bloqueada) VALUES (?, ?, ?, 0) "
-                + "ON CONFLICT(id) DO UPDATE SET location=excluded.location, status=excluded.status";
+        String sql = location != null
+                ? "UPDATE watering_stations SET status = ?, location = ? WHERE id = ?"
+                : "UPDATE watering_stations SET status = ? WHERE id = ?";
         try (Connection conn = DriverManager.getConnection(getUrl());
              PreparedStatement pstmt = conn.prepareStatement(sql)) {
-            pstmt.setString(1, id);
-            pstmt.setString(2, location);
-            pstmt.setString(3, estado);
-            pstmt.executeUpdate();
+            pstmt.setString(1, estado);
+            if (location != null) {
+                pstmt.setString(2, location);
+                pstmt.setString(3, id);
+            } else {
+                pstmt.setString(2, id);
+            }
+            if (pstmt.executeUpdate() == 0) return null;
 
             estados.put(id, estado);
             bloqueadas.putIfAbsent(id, false);
@@ -136,6 +178,48 @@ public class DatabaseManager {
         } catch (SQLException e) {
             System.err.println("Error registrando estación: " + e.getMessage());
             return null;
+        }
+    }
+
+    public static synchronized String obtenerUbicacion(String id) {
+        try (Connection conn = DriverManager.getConnection(getUrl());
+             PreparedStatement ps = conn.prepareStatement("SELECT location FROM watering_stations WHERE id = ?")) {
+            ps.setString(1, id);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getString(1) : null;
+            }
+        } catch (SQLException e) {
+            return null;
+        }
+    }
+
+    /** Alta administrativa de una estación nueva en la red (desde el panel de CENTRAL). */
+    public static synchronized boolean altaEstacion(String id, String location) {
+        String sql = "INSERT OR IGNORE INTO watering_stations (id, location, status, bloqueada) VALUES (?, ?, 'DESCONECTADA', 0)";
+        try (Connection conn = DriverManager.getConnection(getUrl());
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, id);
+            ps.setString(2, location);
+            if (ps.executeUpdate() == 0) return false; // ya existía
+            estados.put(id, "DESCONECTADA");
+            bloqueadas.put(id, false);
+            return true;
+        } catch (SQLException e) {
+            System.err.println("Error dando de alta la estación [" + id + "]: " + e.getMessage());
+            return false;
+        }
+    }
+
+    /** Alta administrativa de un operario nuevo (desde el panel de CENTRAL). */
+    public static synchronized boolean altaOperario(String id) {
+        try (Connection conn = DriverManager.getConnection(getUrl());
+             PreparedStatement ps = conn.prepareStatement("INSERT OR IGNORE INTO operarios (id, nombre) VALUES (?, ?)")) {
+            ps.setString(1, id);
+            ps.setString(2, "Operario " + id);
+            return ps.executeUpdate() > 0;
+        } catch (SQLException e) {
+            System.err.println("Error dando de alta el operario [" + id + "]: " + e.getMessage());
+            return false;
         }
     }
 
@@ -182,6 +266,119 @@ public class DatabaseManager {
         } catch (SQLException e) {
             System.err.println("Error actualizando bloqueo de [" + id + "]: " + e.getMessage());
         }
+    }
+
+    // ---------------------------------------------------------------- RIEGOS
+
+    /** Datos de un riego guardado: {id, ws, operario, duracion, estado}. */
+    public static synchronized String[] obtenerRiego(String id) {
+        String sql = "SELECT id, ws, operario, duracion, estado FROM riegos WHERE id = ?";
+        try (Connection conn = DriverManager.getConnection(getUrl());
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, id);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) return null;
+                return new String[] { rs.getString(1), rs.getString(2), rs.getString(3),
+                        String.valueOf(rs.getInt(4)), rs.getString(5) };
+            }
+        } catch (SQLException e) {
+            System.err.println("Error consultando riego [" + id + "]: " + e.getMessage());
+            return null;
+        }
+    }
+
+    public static synchronized void guardarRiego(String id, String ws, String operario, int duracion, String estado) {
+        String sql = "INSERT INTO riegos (id, ws, operario, duracion, estado) VALUES (?, ?, ?, ?, ?) "
+                + "ON CONFLICT(id) DO UPDATE SET estado = excluded.estado";
+        try (Connection conn = DriverManager.getConnection(getUrl());
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, id);
+            ps.setString(2, ws);
+            ps.setString(3, operario);
+            ps.setInt(4, duracion);
+            ps.setString(5, estado);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            System.err.println("Error guardando riego [" + id + "]: " + e.getMessage());
+        }
+    }
+
+    public static synchronized void actualizarEstadoRiego(String id, String estado) {
+        String sql = "UPDATE riegos SET estado = ? WHERE id = ?";
+        try (Connection conn = DriverManager.getConnection(getUrl());
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, estado);
+            ps.setString(2, id);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            System.err.println("Error actualizando riego [" + id + "]: " + e.getMessage());
+        }
+    }
+
+    public static synchronized void finalizarRiego(String id, String volumen, String duracionReal, String motivo) {
+        String sql = "UPDATE riegos SET estado = 'FINALIZADO', volumen = ?, duracion_real = ?, motivo_fin = ?, "
+                + "fin = CURRENT_TIMESTAMP WHERE id = ?";
+        try (Connection conn = DriverManager.getConnection(getUrl());
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, volumen);
+            ps.setString(2, duracionReal);
+            ps.setString(3, motivo);
+            ps.setString(4, id);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            System.err.println("Error finalizando riego [" + id + "]: " + e.getMessage());
+        }
+    }
+
+    /** Riegos que CENTRAL cree que siguen en marcha en una estación: lista de {id, operario}. */
+    public static synchronized List<String[]> riegosActivosDe(String ws) {
+        List<String[]> lista = new ArrayList<>();
+        String sql = "SELECT id, operario FROM riegos WHERE ws = ? AND estado = 'ACTIVO'";
+        try (Connection conn = DriverManager.getConnection(getUrl());
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, ws);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) lista.add(new String[] { rs.getString(1), rs.getString(2) });
+            }
+        } catch (SQLException e) {
+            System.err.println("Error consultando riegos activos de [" + ws + "]: " + e.getMessage());
+        }
+        return lista;
+    }
+
+    // ---------------------------------------------------------------- BUZÓN DE OPERARIOS
+
+    public static synchronized void guardarMensajePendiente(String operario, String texto) {
+        String sql = "INSERT INTO mensajes_pendientes (operario, texto) VALUES (?, ?)";
+        try (Connection conn = DriverManager.getConnection(getUrl());
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, operario);
+            ps.setString(2, texto);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            System.err.println("Error guardando mensaje para [" + operario + "]: " + e.getMessage());
+        }
+    }
+
+    /** Devuelve y borra los mensajes pendientes de un operario (en orden de llegada). */
+    public static synchronized List<String> extraerMensajesPendientes(String operario) {
+        List<String> mensajes = new ArrayList<>();
+        try (Connection conn = DriverManager.getConnection(getUrl())) {
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT texto FROM mensajes_pendientes WHERE operario = ? ORDER BY id")) {
+                ps.setString(1, operario);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) mensajes.add(rs.getString(1));
+                }
+            }
+            try (PreparedStatement ps = conn.prepareStatement("DELETE FROM mensajes_pendientes WHERE operario = ?")) {
+                ps.setString(1, operario);
+                ps.executeUpdate();
+            }
+        } catch (SQLException e) {
+            System.err.println("Error leyendo mensajes de [" + operario + "]: " + e.getMessage());
+        }
+        return mensajes;
     }
 
     public static synchronized boolean existeOperario(String id) {

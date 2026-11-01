@@ -109,6 +109,33 @@ server.createContext("/", exchange -> {
                 }
             });
 
+            // 4. Endpoint de altas: /api/alta?tipo=ws&id=WS_11&loc=Parque Central  |  /api/alta?tipo=op&id=FO_11
+            server.createContext("/api/alta", exchange -> {
+                String tipo = null, id = null, loc = null;
+                String query = exchange.getRequestURI().getRawQuery();
+                if (query != null) {
+                    for (String param : query.split("&")) {
+                        String[] pair = param.split("=", 2);
+                        if (pair.length != 2) continue;
+                        String valor = java.net.URLDecoder.decode(pair[1], java.nio.charset.StandardCharsets.UTF_8).trim();
+                        if (pair[0].equals("tipo")) tipo = valor;
+                        if (pair[0].equals("id")) id = valor;
+                        if (pair[0].equals("loc")) loc = valor;
+                    }
+                }
+                String error;
+                if ("ws".equals(tipo)) error = GestorRiegos.altaEstacion(id, loc);
+                else if ("op".equals(tipo)) error = GestorRiegos.altaOperario(id);
+                else error = "Tipo de alta desconocido";
+
+                byte[] resp = (error == null ? "OK" : error).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                exchange.getResponseHeaders().add("Content-Type", "text/plain; charset=UTF-8");
+                exchange.sendResponseHeaders(200, resp.length);
+                try (OutputStream os = exchange.getResponseBody()) {
+                    os.write(resp);
+                }
+            });
+
             server.setExecutor(java.util.concurrent.Executors.newCachedThreadPool());
             server.start();
             System.out.println("[WEB] Dashboard moderno disponible en: http://localhost:" + puerto);

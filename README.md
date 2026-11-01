@@ -28,7 +28,8 @@ Componentes comunicados mediante **sockets** (protocolo `<STX><DATA><ETX><LRC>`)
 | KafkaManager | `CoreSystem/.../KafkaManager.java` | Publica los eventos en `wm-eventos` (clave = id de la WS). |
 | **WM_WS_M** | `Water_Station/WM_WS_M.java` | Monitor: se registra en CENTRAL, supervisa al Engine (HEALTH_CHECK cada segundo), autoriza riegos y controla su duración. |
 | **WM_WS_E** | `Water_Station/WM_WS_E.java` | Engine: electroválvula, caudalímetro simulado, detector de fugas (tecla K) y menú de la estación. |
-| **WM_FO** | `Water_Station/WM_FO.java` | Operario: pide riegos (manual o desde fichero) y ve la telemetría de su WS. |
+| **WM_FO** | `Water_Station/WM_FO.java` | Operario: pide riegos (manual o desde fichero, también en modo automático) y ve la telemetría de su WS. |
+| Protocolo | `Water_Station/Protocolo.java` | Tramas `<STX><DATA><ETX><LRC>` y ACK/NACK, común a Monitor, Engine y Operario. |
 
 ## Mecánica de un riego
 
@@ -44,14 +45,14 @@ Componentes comunicados mediante **sockets** (protocolo `<STX><DATA><ETX><LRC>`)
 
 ### Protocolo de sockets
 
-Trama: `<STX>CODIGO#campo1#...#campoN<ETX><LRC>` con `LRC = XOR` de los bytes de STX a ETX. CENTRAL responde `<ACK>` o `<NACK>motivo`.
+**Todos** los mensajes por socket (Operario ↔ CENTRAL, Monitor ↔ CENTRAL y Monitor ↔ Engine) van en tramas `<STX>CODIGO#campo1#...#campoN<ETX><LRC>` con `LRC = XOR` de los caracteres de STX a ETX. Quien recibe una trama comprueba formato y LRC y responde `<ACK>` si es correcta o `<NACK>[motivo]` si no (los ACK/NACK no se responden). En CENTRAL lo implementa `WM_Central_Thread`; en las estaciones y el operario, la clase `Protocolo`.
 
 | Origen → Destino | Mensajes |
 |---|---|
-| Monitor → CENTRAL | `REGISTRO#id#ubicación`, `PING#id`, `RIEGO_AUTORIZADO#riegoId`, `RIEGO_DENEGADO#riegoId#motivo`, `TELEMETRIA#id#caudal#vol`, `FIN_RIEGO#id#vol#dur`, `AVERIA#id`, `RESUELTA#id`, `SOLICITUD_MANUAL#id#dur` |
-| CENTRAL → Monitor | `SOLICITUD_RIEGO#riegoId#operario#dur`, `ABORTAR_RIEGO#motivo`, `AVISO#texto` |
+| Monitor → CENTRAL | `REGISTRO#id#ubicación[#riegoId#operario#dur]`, `PING#id`, `RIEGO_AUTORIZADO#riegoId`, `RIEGO_DENEGADO#riegoId#motivo`, `TELEMETRIA#id#caudal#vol`, `FIN_RIEGO#id#vol#dur#riegoId#motivo`, `AVERIA#id`, `RESUELTA#id`, `SOLICITUD_MANUAL#id#dur`, `SINCRONIZADO#id` |
+| CENTRAL → Monitor | `SOLICITUD_RIEGO#riegoId#operario#dur`, `ABORTAR_RIEGO#motivo`, `CONFIRMACION_FIN#riegoId`, `AVISO#texto` |
 | Operario → CENTRAL | `REGISTRO_OPERARIO#id`, `ACTIVAR#ws#id#dur`, `LISTAR_WS#id`, `PING#id` |
-| CENTRAL → Operario | Texto: `PROCESANDO:`, `AUTORIZADO:`, `DENEGADO:`, `ABORTADO:`, `RESUMEN_FIN_RIEGO:`, `LISTA_ESTACIONES:` |
+| CENTRAL → Operario | Texto: `PROCESANDO:`, `AUTORIZADO:`, `REANUDADO:`, `DENEGADO:`, `ABORTADO:`, `RESUMEN_FIN_RIEGO:`, `LISTA_ESTACIONES:`, `SERVICIO_EN_CURSO:`, `AVISO:` |
 | Monitor ↔ Engine (local) | `HEALTH_CHECK` → `OK`/`KO`; `TELEMETRIA`, `FIN_RIEGO`, `SOLICITUD_MANUAL`; `FINALIZAR_RIEGO`, `ABORTAR_RIEGO`, `INICIO_RIEGO` (respaldo), `AVISO` |
 
 ### Eventos Kafka (`wm-eventos`, clave = id de la WS)
@@ -62,12 +63,28 @@ Trama: `<STX>CODIGO#campo1#...#campoN<ETX><LRC>` con `LRC = XOR` de los bytes de
 
 1. **Reconexión automática**: Monitor y Operario reconectan con CENTRAL con backoff exponencial (2, 4, 8… máx. 30 s) y se vuelven a registrar; el Engine reintenta con su Monitor cada 2 s.
 2. **Detección de caídas**: CENTRAL cierra un socket sin actividad durante 15 s y marca la WS como **DESCONECTADA**. Monitor y Operario envían `PING` cada 5 s si no hay tráfico, y detectan sockets semiabiertos (20 s sin respuesta).
-3. **Válvula a prueba de fallos**: si el Engine pierde el enlace con el Monitor (error o 5 s sin mensajes) cierra la válvula. Si una WS cae regando, CENTRAL aborta el riego, avisa al operario y publica `ABORTO_RIEGO`. Si el Monitor pierde CENTRAL, aborta el riego local.
+3. **Válvula a prueba de fallos**: si el Engine pierde el enlace con el Monitor (error o 5 s sin mensajes) cierra la válvula y muestra **ESTACIÓN AVERIADA** (no admite riegos ni manuales). Si una WS cae regando, CENTRAL aborta el riego, avisa al operario y publica `ABORTO_RIEGO`.
 4. **ServerSocket del Monitor siempre abierto**: si el Engine se reinicia, el Monitor acepta la nueva conexión y reanuda los `HEALTH_CHECK`.
 5. **Kafka**: el Engine consume `wm-eventos` con grupo persistente `ws-engine-<id>` e ignora eventos de más de 30 s (no reabre la válvula al reiniciar). La Central publica en un hilo aparte con cola acotada (si Kafka cae, los sockets siguen funcionando) y reintenta la conexión. Si Kafka no entrega `INICIO_RIEGO` en 6 s, el Monitor envía la orden por socket como respaldo.
 6. **Persistencia en Railway**: la BD se guarda en `DB_PATH` (`/app/data/water_management.db` en Docker); montad un volumen de Railway en `/app/data`. Las estaciones bloqueadas siguen bloqueadas tras un reinicio.
 
-Otras validaciones: los operarios deben estar dados de alta en la BD (por defecto `FO_01` … `FO_10`), se rechazan IDs duplicados con una conexión activa y se controla que dos operarios no pidan la misma WS a la vez.
+### Ninguna transacción se pierde (caídas de la guía de corrección)
+
+| Cae… | Qué pasa |
+|---|---|
+| **WM_Central** | Las WS siguen regando hasta terminar; no se admiten nuevos riegos ("Imposible conectar con WM_Central" en FO, Monitor y Engine). Los `FIN_RIEGO` quedan guardados en el Monitor y se reenvían al reconectar hasta que CENTRAL responde `CONFIRMACION_FIN`. Los riegos están en SQLite (tabla `riegos`), así que una CENTRAL reiniciada reconoce el riego: si sigue en marcha, la WS lo declara al registrarse (`REGISTRO#id#ubic#riegoId#operario#dur`) y vuelve a REGANDO. |
+| **Un operario (FO)** | El riego sigue. Los mensajes que no se le pudieron entregar se guardan en su buzón (tabla `mensajes_pendientes`) y los recibe al volver; si el riego sigue en curso, vuelve a ver su telemetría. |
+| **El Engine** | El Monitor notifica la avería (WS en rojo), CENTRAL avisa al operario y el Monitor guarda lo regado (última telemetría). Al recuperarse el Engine, se envía el estado final del riego y el operario recibe el resumen. |
+| **El Monitor** | CENTRAL marca la WS como DESCONECTADA y avisa al operario. El Engine cierra la válvula, muestra ESTACIÓN AVERIADA y guarda el estado final, que entrega al Monitor cuando vuelve. |
+
+Todo cierre de válvula genera `FIN_RIEGO#ws#volumen#duración#riegoId#motivo` (`TIEMPO`, `MANUAL`, `ABORTADO`, `AVERIA`, `ENLACE`); CENTRAL lo procesa una sola vez aunque llegue repetido.
+
+### Autenticación y altas
+
+- **Estaciones**: solo se admiten las dadas de alta en la BD de CENTRAL (por defecto `WS_01` … `WS_10`, repartidas por las zonas del mapa). Cualquier otra recibe `NACK WS_NO_REGISTRADA` y su Monitor muestra "Autenticación DENEGADA".
+- **Operarios**: por defecto `FO_01` … `FO_10`; uno no registrado es rechazado y la aplicación se cierra.
+- **Altas nuevas**: desde el panel web (*Network registry*) o con `GET /api/alta?tipo=ws&id=WS_11&loc=Plaza%20Mayor` / `GET /api/alta?tipo=op&id=FO_11`.
+- Se rechazan IDs duplicados con una conexión activa y se controla que dos operarios no pidan la misma WS a la vez.
 
 ## Despliegue
 
@@ -94,7 +111,17 @@ docker attach engine-ws1    # menú de la estación (Ctrl+P, Ctrl+Q para salir)
 docker attach fo1           # menú del operario
 ```
 
-Sin Docker (Windows, requiere JDK 21+): `Arrancar_Monitor.bat <host> <puerto> WS_01 "Parque Central" 7000`, `Arrancar_Engine.bat <broker> 7000 WS_01` y `Arrancar_Operario.bat <broker> FO_01 <host> <puerto>`.
+Sin Docker (Windows, solo requiere **Java 11+**, no se compila nada): los `.jar` ya generados (`WM_WS_M.jar`, `WM_WS_E.jar`, `WM_FO.jar`) se lanzan con los scripts, que preguntan el ID al arrancar y usan por defecto las direcciones de Railway:
+
+```bat
+Arrancar_Monitor.bat     :: ID de la WS, ubicación (Enter = la de CENTRAL), puerto local
+Arrancar_Engine.bat      :: ID de la WS y puerto de su Monitor
+Arrancar_Operario.bat    :: ID del operario y fichero de servicios (Enter = solo menú)
+```
+
+También se pueden pasar como parámetros, p. ej. `Arrancar_Operario.bat iriguchi.proxy.rlwy.net:38689 FO_01 monorail.proxy.rlwy.net 32265 servicios_ejemplo.txt`, o directamente `java -jar WM_FO.jar <broker> FO_01 <host> <puerto> [fichero]`.
+
+**Modo automático (sin interacción)**: si el operario recibe un fichero de servicios, al conectarse los ejecuta uno tras otro (4 s entre servicios) y después muestra el menú. `compilar.bat` regenera los `.jar` (solo para desarrollo).
 
 ### Menús
 
