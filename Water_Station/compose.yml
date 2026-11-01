@@ -1,9 +1,8 @@
 # Despliegue de LABORATORIO (Figura 4 del enunciado).
-# CENTRAL y KAFKA están en Railway: rellenad las variables en un fichero .env junto a este compose:
-#
-#   CENTRAL_HOST=xxxx.proxy.rlwy.net     # TCP Proxy de WM_Central (puerto de sockets)
-#   CENTRAL_PORT=12345
-#   KAFKA_BROKER=yyyy.proxy.rlwy.net:38689
+# CENTRAL y KAFKA están en Railway. Por defecto se usan sus TCP Proxy:
+#   WM_Central: monorail.proxy.rlwy.net:32265 (-> :6000)
+#   Kafka:      iriguchi.proxy.rlwy.net:38689 (-> :9092)
+# Para cambiarlos, cread un fichero .env junto a este compose con CENTRAL_HOST, CENTRAL_PORT y KAFKA_BROKER.
 #
 # PC LAB 2 (estaciones):  docker compose up -d monitor-ws1 engine-ws1 monitor-ws2 engine-ws2
 # PC LAB 1 (operarios):   docker compose up -d fo1 fo2
@@ -20,31 +19,31 @@ services:
   monitor-ws1:
     <<: *lab
     container_name: monitor-ws1
-    command: ["WM_WS_M", "7000", "${CENTRAL_HOST}", "${CENTRAL_PORT}", "WS_01", "Parque Central"]
+    command: ["WM_WS_M", "7000", "${CENTRAL_HOST:-monorail.proxy.rlwy.net}", "${CENTRAL_PORT:-32265}", "WS_01", "Parque Central"]
 
   engine-ws1:
     <<: *lab
     container_name: engine-ws1
-    command: ["WM_WS_E", "${KAFKA_BROKER}", "monitor-ws1", "7000", "WS_01"]
+    command: ["WM_WS_E", "${KAFKA_BROKER:-iriguchi.proxy.rlwy.net:38689}", "monitor-ws1", "7000", "WS_01"]
     depends_on: [monitor-ws1]
 
   monitor-ws2:
     <<: *lab
     container_name: monitor-ws2
-    command: ["WM_WS_M", "7000", "${CENTRAL_HOST}", "${CENTRAL_PORT}", "WS_02", "Jardines del Río"]
+    command: ["WM_WS_M", "7000", "${CENTRAL_HOST:-monorail.proxy.rlwy.net}", "${CENTRAL_PORT:-32265}", "WS_02", "Jardines del Río"]
 
   engine-ws2:
     <<: *lab
     container_name: engine-ws2
-    command: ["WM_WS_E", "${KAFKA_BROKER}", "monitor-ws2", "7000", "WS_02"]
+    command: ["WM_WS_E", "${KAFKA_BROKER:-iriguchi.proxy.rlwy.net:38689}", "monitor-ws2", "7000", "WS_02"]
     depends_on: [monitor-ws2]
 
   fo1:
     <<: *lab
     container_name: fo1
-    command: ["WM_FO", "${KAFKA_BROKER}", "FO_01", "${CENTRAL_HOST}", "${CENTRAL_PORT}"]
+    command: ["WM_FO", "${KAFKA_BROKER:-iriguchi.proxy.rlwy.net:38689}", "FO_01", "${CENTRAL_HOST:-monorail.proxy.rlwy.net}", "${CENTRAL_PORT:-32265}"]
 
   fo2:
     <<: *lab
     container_name: fo2
-    command: ["WM_FO", "${KAFKA_BROKER}", "FO_02", "${CENTRAL_HOST}", "${CENTRAL_PORT}"]
+    command: ["WM_FO", "${KAFKA_BROKER:-iriguchi.proxy.rlwy.net:38689}", "FO_02", "${CENTRAL_HOST:-monorail.proxy.rlwy.net}", "${CENTRAL_PORT:-32265}"]

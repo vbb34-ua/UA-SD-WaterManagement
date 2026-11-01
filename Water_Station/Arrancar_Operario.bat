@@ -59,9 +59,11 @@ set CENTRAL_HOST=%3
 set CENTRAL_PORT=%4
 
 if "%KAFKA_BROKER%"=="" set KAFKA_BROKER=iriguchi.proxy.rlwy.net:38689
+if "%OP_ID%"=="" set /p OP_ID="ID del operario a registrar [FO_01]: "
 if "%OP_ID%"=="" set OP_ID=FO_01
-if "%CENTRAL_HOST%"=="" set /p CENTRAL_HOST="Introduce el HOST del TCP Proxy de Central (ej. proxy.rlwy.net): "
-if "%CENTRAL_PORT%"=="" set /p CENTRAL_PORT="Introduce el PUERTO del TCP Proxy de Central (ej. 12345): "
+REM Por defecto: TCP Proxy de WM_Central en Railway (-> :6000)
+if "%CENTRAL_HOST%"=="" set CENTRAL_HOST=monorail.proxy.rlwy.net
+if "%CENTRAL_PORT%"=="" set CENTRAL_PORT=32265
 
 echo.
 echo ==============================================================

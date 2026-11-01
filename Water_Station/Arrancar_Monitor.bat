@@ -59,10 +59,14 @@ set WS_ID=%3
 set UBICACION=%~4
 set MONITOR_PORT=%5
 
-if "%CENTRAL_HOST%"=="" set /p CENTRAL_HOST="Introduce el HOST del TCP Proxy de Central (ej. proxy.rlwy.net): "
-if "%CENTRAL_PORT%"=="" set /p CENTRAL_PORT="Introduce el PUERTO del TCP Proxy de Central (ej. 12345): "
+REM Por defecto: TCP Proxy de WM_Central en Railway (-> :6000)
+if "%CENTRAL_HOST%"=="" set CENTRAL_HOST=monorail.proxy.rlwy.net
+if "%CENTRAL_PORT%"=="" set CENTRAL_PORT=32265
+if "%WS_ID%"=="" set /p WS_ID="ID de la estacion a registrar [WS_01]: "
 if "%WS_ID%"=="" set WS_ID=WS_01
+if "%UBICACION%"=="" set /p UBICACION="Ubicacion de la estacion [Parque Central]: "
 if "%UBICACION%"=="" set UBICACION=Parque Central
+if "%MONITOR_PORT%"=="" set /p MONITOR_PORT="Puerto local para el Engine (distinto por cada WS en el mismo PC) [7000]: "
 if "%MONITOR_PORT%"=="" set MONITOR_PORT=7000
 
 echo.
