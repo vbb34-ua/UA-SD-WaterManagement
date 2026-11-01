@@ -223,35 +223,32 @@ public class GestorRiegos {
     // ---------------------------------------------------------------- RIEGO
 
     /** Paso 4 de la mecánica: valida la estación y pide autorización a su Monitor. */
-    public static synchronized void solicitarRiego(String ws, String operario, int duracion) {
+    public static synchronized String solicitarRiego(String ws, String operario, int duracion) {
         duracion = normalizarDuracion(duracion);
         Dashboard.log("Petición de activación para WS [" + ws + "] por [" + operario + "] (" + duracion + " s).");
         notificarOperario(operario, ws, "PROCESANDO: Comprobando el estado de la estación " + ws + "...", false);
 
         if (!DatabaseManager.existeEstacion(ws)) {
-            denegar(ws, operario, "La estación " + ws + " no existe en CENTRAL");
-            return;
+            return denegar(ws, operario, "La estación " + ws + " no existe en CENTRAL");
         }
         String estado = DatabaseManager.obtenerEstado(ws);
         if (!"DISPONIBLE".equals(estado)) {
-            denegar(ws, operario, "La estación " + ws + " se encuentra en estado " + estado);
-            return;
+            return denegar(ws, operario, "La estación " + ws + " se encuentra en estado " + estado);
         }
         WM_Central_Thread hiloWS = estacionesConectadas.get(ws);
         if (hiloWS == null) {
-            denegar(ws, operario, "La estación " + ws + " está desconectada");
-            return;
+            return denegar(ws, operario, "La estación " + ws + " está desconectada");
         }
         Riego pendiente = pendientes.get(ws);
         if (pendiente != null && System.currentTimeMillis() - pendiente.creado < TIMEOUT_SOLICITUD_MS) {
-            denegar(ws, operario, "La estación " + ws + " ya tiene otra solicitud en curso");
-            return;
+            return denegar(ws, operario, "La estación " + ws + " ya tiene otra solicitud en curso");
         }
 
         Riego r = new Riego("R" + System.currentTimeMillis() + "_" + (++contadorRiegos), ws, operario, duracion);
         pendientes.put(ws, r);
         notificarOperario(operario, ws, "PROCESANDO: Estación " + ws + " disponible. Solicitando autorización a la estación...", false);
         hiloWS.enviarTrama("SOLICITUD_RIEGO#" + r.id + "#" + operario + "#" + duracion);
+        return null;
     }
 
     public static synchronized void riegoAutorizado(String ws, String riegoId) {
@@ -374,8 +371,9 @@ public class GestorRiegos {
 
     // ---------------------------------------------------------------- ÓRDENES DE CENTRAL (punto 11)
 
-    public static synchronized void iniciarDesdeCentral(String ws, int duracion) {
-        solicitarRiego(ws, OPERARIO_CENTRAL, duracion);
+    /** Devuelve null si la solicitud se envió a la estación, o el motivo de la denegación. */
+    public static synchronized String iniciarDesdeCentral(String ws, int duracion) {
+        return solicitarRiego(ws, OPERARIO_CENTRAL, duracion);
     }
 
     public static synchronized void bloquear(String ws) {
@@ -437,9 +435,10 @@ public class GestorRiegos {
         }
     }
 
-    private static void denegar(String ws, String operario, String motivo) {
+    private static String denegar(String ws, String operario, String motivo) {
         Dashboard.log("Riego DENEGADO para [" + operario + "] en WS [" + ws + "]: " + motivo);
         notificarOperario(operario, ws, "DENEGADO: " + motivo, true);
+        return motivo;
     }
 
     private static void cambiarEstado(String ws, Dashboard.Estado estado) {

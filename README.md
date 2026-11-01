@@ -24,7 +24,8 @@ Componentes comunicados mediante **sockets** (protocolo `<STX><DATA><ETX><LRC>`)
 | GestorRiegos | `CoreSystem/.../GestorRiegos.java` | Lógica de negocio: altas, ciclo de riego, averías, órdenes de CENTRAL. |
 | WM_Central_Thread | `CoreSystem/.../WM_Central_Thread.java` | Atiende un socket: valida tramas (LRC), responde ACK/NACK, timeout de 15 s. |
 | DatabaseManager | `CoreSystem/.../DatabaseManager.java` | SQLite: tablas `watering_stations` y `operarios`. |
-| WebDashboard / Dashboard | `CoreSystem/.../WebDashboard.java`, `index.html` | Panel en tiempo real (SSE) con los 5 estados y las órdenes de CENTRAL. |
+| WebDashboard / Dashboard | `CoreSystem/.../WebDashboard.java`, `Dashboard.java` | Servidor HTTP del panel: ficheros estáticos, eventos en tiempo real (SSE, con latido cada 15 s) y API de órdenes y altas. |
+| Panel web | `CoreSystem/src/main/resources/web/` | `index.html` + `css/styles.css` + módulos JS: `store.js` (estado y SSE), `map.js` (mapa por zonas), `stations.js` (tabla y listas), `detail.js` (panel lateral de una WS), `control.js` (órdenes globales y altas), `events.js` (historial), `api.js`, `ui.js`, `app.js` (pestañas). |
 | KafkaManager | `CoreSystem/.../KafkaManager.java` | Publica los eventos en `wm-eventos` (clave = id de la WS). |
 | **WM_WS_M** | `Water_Station/WM_WS_M.java` | Monitor: se registra en CENTRAL, supervisa al Engine (HEALTH_CHECK cada segundo), autoriza riegos y controla su duración. |
 | **WM_WS_E** | `Water_Station/WM_WS_E.java` | Engine: electroválvula, caudalímetro simulado, detector de fugas (tecla K) y menú de la estación. |

@@ -31,7 +31,7 @@ public class Dashboard {
 
     private static final Map<String, WSInfo> estaciones = new ConcurrentHashMap<>();
     private static final LinkedList<String> logs = new LinkedList<>();
-    private static final int MAX_LOGS = 15;
+    private static final int MAX_LOGS = 200;
 
     public static void iniciar() {
         log("Sistema CENTRAL iniciado. La interfaz gráfica está en el Dashboard Web.");
@@ -118,6 +118,18 @@ public class Dashboard {
         }
         json.append("]");
         return json.toString();
+    }
+
+    /** Historial de eventos (para los navegadores que se conectan): ["[hh:mm:ss] msg", ...] */
+    public static synchronized String obtenerLogsJSON() {
+        StringBuilder json = new StringBuilder("[");
+        boolean primero = true;
+        for (String l : logs) {
+            if (!primero) json.append(",");
+            json.append("\"").append(esc(l)).append("\"");
+            primero = false;
+        }
+        return json.append("]").toString();
     }
 
     public static synchronized String obtenerListadoEstaciones() {

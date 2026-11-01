@@ -1,166 +1,221 @@
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 
+/**
+ * Panel web de CENTRAL (HTTP).
+ *  - "/"            : ficheros estáticos de src/main/resources/web (index.html, css, js)
+ *  - "/events"      : Server-Sent Events con el estado en tiempo real
+ *  - "/api/action"  : órdenes de CENTRAL a una WS o a todas (START, BLOCK, ACTIVATE)
+ *  - "/api/alta"    : alta de estaciones y operarios
+ */
 public class WebDashboard {
 
     private static HttpServer server;
-    // Lista de clientes conectados a la página web esperando eventos en tiempo real
+    /** Navegadores conectados esperando eventos en tiempo real. */
     private static final List<HttpExchange> clientesSSE = new CopyOnWriteArrayList<>();
+
+    private static final Map<String, String> TIPOS_MIME = new HashMap<>();
+    static {
+        TIPOS_MIME.put("html", "text/html; charset=UTF-8");
+        TIPOS_MIME.put("css", "text/css; charset=UTF-8");
+        TIPOS_MIME.put("js", "text/javascript; charset=UTF-8");
+        TIPOS_MIME.put("svg", "image/svg+xml");
+        TIPOS_MIME.put("png", "image/png");
+        TIPOS_MIME.put("ico", "image/x-icon");
+    }
 
     public static void iniciar(int puerto) {
         try {
             server = HttpServer.create(new InetSocketAddress(puerto), 0);
-            
-// 1. Endpoint para servir la página web HTML desde el JAR
-server.createContext("/", exchange -> {
-    // Intentamos leer el archivo dentro del JAR (debe estar en src/main/resources/index.html)
-    try (java.io.InputStream is = WebDashboard.class.getResourceAsStream("/index.html")) {
-        if (is != null) {
-            byte[] bytes = is.readAllBytes();
-            exchange.getResponseHeaders().add("Content-Type", "text/html; charset=UTF-8");
-            exchange.sendResponseHeaders(200, bytes.length);
-            try (OutputStream os = exchange.getResponseBody()) {
-                os.write(bytes);
-            }
-        } else {
-            String response = "Error 404: No se encuentra index.html en src/main/resources/";
-            exchange.sendResponseHeaders(404, response.length());
-            try (OutputStream os = exchange.getResponseBody()) {
-                os.write(response.getBytes());
-            }
-        }
-    } catch (IOException e) {
-        System.err.println("[WEB] Error al servir index.html: " + e.getMessage());
-    }
-});
 
-            // 2. Endpoint SSE (Server-Sent Events) para actualizaciones en tiempo real
+            // 1. Ficheros estáticos del panel (empaquetados dentro del JAR)
+            server.createContext("/", WebDashboard::servirEstatico);
+
+            // 2. Server-Sent Events: estado inicial + cambios en tiempo real
             server.createContext("/events", exchange -> {
-                exchange.getResponseHeaders().add("Content-Type", "text/event-stream");
+                exchange.getResponseHeaders().add("Content-Type", "text/event-stream; charset=UTF-8");
                 exchange.getResponseHeaders().add("Cache-Control", "no-cache");
                 exchange.getResponseHeaders().add("Connection", "keep-alive");
-                exchange.getResponseHeaders().add("Access-Control-Allow-Origin", "*");
-                exchange.sendResponseHeaders(200, 0); // 0 = response de longitud arbitraria
-                
-                clientesSSE.add(exchange);
+                exchange.sendResponseHeaders(200, 0); // longitud indefinida
+
+                // Solo a este navegador: estado actual de la red e historial de eventos.
+                // Mismo orden de cerrojos que Dashboard -> broadcast (Dashboard y luego WebDashboard)
+                // para no perder cambios entre el estado inicial y el alta del cliente, sin interbloqueos.
+                synchronized (Dashboard.class) {
+                    synchronized (WebDashboard.class) {
+                        enviar(exchange, "ESTADO_INICIAL", Dashboard.obtenerEstadoJSON());
+                        enviar(exchange, "LOGS_INICIALES", Dashboard.obtenerLogsJSON());
+                        clientesSSE.add(exchange);
+                    }
+                }
                 System.out.println("[WEB] Nuevo navegador conectado al Dashboard.");
-                
-                // Enviamos un evento inicial para forzar que el Dashboard envíe todo su estado
-                broadcast("ESTADO_INICIAL", Dashboard.obtenerEstadoJSON());
             });
 
-            // 3. Endpoint API para acciones manuales (Subtarea 6)
+            // 3. Órdenes de CENTRAL (punto 11): a UNA estación (ws=<id>) o a TODAS (ws=ALL)
             server.createContext("/api/action", exchange -> {
-                String query = exchange.getRequestURI().getQuery();
-                String response = "OK";
-                
-                if (query != null) {
-                    String ws = null;
-                    String action = null;
-                    int duracion = GestorRiegos.DURACION_DEFECTO_S;
+                Map<String, String> p = parametros(exchange);
+                String ws = p.get("ws");
+                String action = p.get("action");
+                int duracion = GestorRiegos.DURACION_DEFECTO_S;
+                try { duracion = Integer.parseInt(p.getOrDefault("dur", "")); } catch (NumberFormatException ignored) {}
 
-                    for (String param : query.split("&")) {
-                        String[] pair = param.split("=");
-                        if (pair.length == 2) {
-                            String valor = java.net.URLDecoder.decode(pair[1], java.nio.charset.StandardCharsets.UTF_8);
-                            if (pair[0].equals("ws")) ws = valor;
-                            if (pair[0].equals("action")) action = valor;
-                            if (pair[0].equals("dur")) {
-                                try { duracion = Integer.parseInt(valor); } catch (NumberFormatException ignored) {}
+                String respuesta = "OK";
+                if (ws == null || action == null) {
+                    respuesta = "Parámetros incompletos";
+                } else {
+                    boolean todas = "ALL".equals(ws);
+                    switch (action) {
+                        case "START" -> {
+                            if (todas) GestorRiegos.iniciarTodas(duracion);
+                            else {
+                                String error = GestorRiegos.iniciarDesdeCentral(ws, duracion);
+                                if (error != null) respuesta = error;
                             }
                         }
-                    }
-
-                    // Punto 11: órdenes a UNA estación (ws=<id>) o a TODAS (ws=ALL)
-                    if (ws != null && action != null) {
-                        boolean todas = "ALL".equals(ws);
-                        switch (action) {
-                            case "START" -> {
-                                if (todas) GestorRiegos.iniciarTodas(duracion);
-                                else GestorRiegos.iniciarDesdeCentral(ws, duracion);
-                            }
-                            case "BLOCK" -> {
-                                if (todas) GestorRiegos.bloquearTodas();
-                                else GestorRiegos.bloquear(ws);
-                            }
-                            case "ACTIVATE" -> {
-                                if (todas) GestorRiegos.activarTodas();
-                                else GestorRiegos.activar(ws);
-                            }
-                            default -> response = "ACCION_DESCONOCIDA";
+                        case "BLOCK" -> {
+                            if (todas) GestorRiegos.bloquearTodas();
+                            else GestorRiegos.bloquear(ws);
                         }
-                    } else {
-                        response = "PARAMETROS_INCOMPLETOS";
+                        case "ACTIVATE" -> {
+                            if (todas) GestorRiegos.activarTodas();
+                            else GestorRiegos.activar(ws);
+                        }
+                        default -> respuesta = "Acción desconocida";
                     }
                 }
-                
-                // Respondemos al navegador
-                exchange.getResponseHeaders().add("Access-Control-Allow-Origin", "*");
-                exchange.sendResponseHeaders(200, response.length());
-                try (OutputStream os = exchange.getResponseBody()) {
-                    os.write(response.getBytes());
-                }
+                responderTexto(exchange, respuesta);
             });
 
-            // 4. Endpoint de altas: /api/alta?tipo=ws&id=WS_11&loc=Parque Central  |  /api/alta?tipo=op&id=FO_11
+            // 4. Altas: /api/alta?tipo=ws&id=WS_11&loc=Plaza Mayor  |  /api/alta?tipo=op&id=FO_11
             server.createContext("/api/alta", exchange -> {
-                String tipo = null, id = null, loc = null;
-                String query = exchange.getRequestURI().getRawQuery();
-                if (query != null) {
-                    for (String param : query.split("&")) {
-                        String[] pair = param.split("=", 2);
-                        if (pair.length != 2) continue;
-                        String valor = java.net.URLDecoder.decode(pair[1], java.nio.charset.StandardCharsets.UTF_8).trim();
-                        if (pair[0].equals("tipo")) tipo = valor;
-                        if (pair[0].equals("id")) id = valor;
-                        if (pair[0].equals("loc")) loc = valor;
-                    }
-                }
+                Map<String, String> p = parametros(exchange);
+                String tipo = p.get("tipo");
                 String error;
-                if ("ws".equals(tipo)) error = GestorRiegos.altaEstacion(id, loc);
-                else if ("op".equals(tipo)) error = GestorRiegos.altaOperario(id);
+                if ("ws".equals(tipo)) error = GestorRiegos.altaEstacion(p.get("id"), p.get("loc"));
+                else if ("op".equals(tipo)) error = GestorRiegos.altaOperario(p.get("id"));
                 else error = "Tipo de alta desconocido";
-
-                byte[] resp = (error == null ? "OK" : error).getBytes(java.nio.charset.StandardCharsets.UTF_8);
-                exchange.getResponseHeaders().add("Content-Type", "text/plain; charset=UTF-8");
-                exchange.sendResponseHeaders(200, resp.length);
-                try (OutputStream os = exchange.getResponseBody()) {
-                    os.write(resp);
-                }
+                responderTexto(exchange, error == null ? "OK" : error);
             });
 
-            server.setExecutor(java.util.concurrent.Executors.newCachedThreadPool());
+            server.setExecutor(Executors.newCachedThreadPool());
             server.start();
-            System.out.println("[WEB] Dashboard moderno disponible en: http://localhost:" + puerto);
 
+            // Latido cada 15 s: mantiene viva la conexión SSE a través de proxies (Railway)
+            // y detecta navegadores que ya se cerraron.
+            Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "Hilo-SSE-Latido");
+                t.setDaemon(true);
+                return t;
+            }).scheduleAtFixedRate(WebDashboard::latido, 15, 15, TimeUnit.SECONDS);
+
+            System.out.println("[WEB] Dashboard disponible en: http://localhost:" + puerto);
         } catch (IOException e) {
             System.err.println("[WEB] Error arrancando el servidor HTTP: " + e.getMessage());
         }
     }
 
-    // Método que el antiguo Dashboard llamará para notificar a todos los navegadores
-    public static void broadcast(String tipoEvento, String datosJSON) {
-        String mensaje = "event: " + tipoEvento + "\ndata: " + datosJSON + "\n\n";
-        
+    // ---------------------------------------------------------------- FICHEROS ESTÁTICOS
+
+    private static void servirEstatico(HttpExchange exchange) throws IOException {
+        String ruta = exchange.getRequestURI().getPath();
+        if (ruta.equals("/")) ruta = "/index.html";
+
+        // Solo rutas simples dentro de /web (sin "..")
+        if (ruta.contains("..") || !ruta.matches("[A-Za-z0-9_\\-./]+")) {
+            responder(exchange, 400, "text/plain; charset=UTF-8", "Ruta no válida".getBytes(StandardCharsets.UTF_8));
+            return;
+        }
+
+        try (InputStream is = WebDashboard.class.getResourceAsStream("/web" + ruta)) {
+            if (is == null) {
+                responder(exchange, 404, "text/plain; charset=UTF-8", "404 - No encontrado".getBytes(StandardCharsets.UTF_8));
+                return;
+            }
+            String ext = ruta.substring(ruta.lastIndexOf('.') + 1).toLowerCase();
+            exchange.getResponseHeaders().add("Cache-Control", "no-cache");
+            responder(exchange, 200, TIPOS_MIME.getOrDefault(ext, "application/octet-stream"), is.readAllBytes());
+        }
+    }
+
+    // ---------------------------------------------------------------- SSE
+
+    /** Envía un evento a todos los navegadores conectados. */
+    public static synchronized void broadcast(String tipoEvento, String datosJSON) {
         List<HttpExchange> caidos = new ArrayList<>();
-        
+        for (HttpExchange cliente : clientesSSE) {
+            if (!enviar(cliente, tipoEvento, datosJSON)) caidos.add(cliente);
+        }
+        quitar(caidos);
+    }
+
+    private static synchronized void latido() {
+        List<HttpExchange> caidos = new ArrayList<>();
         for (HttpExchange cliente : clientesSSE) {
             try {
                 OutputStream os = cliente.getResponseBody();
-                os.write(mensaje.getBytes("UTF-8"));
+                os.write(": ping\n\n".getBytes(StandardCharsets.UTF_8));
                 os.flush();
             } catch (IOException e) {
-                // Si falla (ej. cerraron la pestaña), lo marcamos para borrarlo
                 caidos.add(cliente);
             }
         }
-        clientesSSE.removeAll(caidos);
+        quitar(caidos);
+    }
+
+    private static boolean enviar(HttpExchange cliente, String tipoEvento, String datosJSON) {
+        try {
+            OutputStream os = cliente.getResponseBody();
+            os.write(("event: " + tipoEvento + "\ndata: " + datosJSON + "\n\n").getBytes(StandardCharsets.UTF_8));
+            os.flush();
+            return true;
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    private static void quitar(List<HttpExchange> caidos) {
+        for (HttpExchange c : caidos) {
+            clientesSSE.remove(c);
+            try { c.close(); } catch (Exception ignored) {}
+        }
+    }
+
+    // ---------------------------------------------------------------- AUXILIARES
+
+    private static Map<String, String> parametros(HttpExchange exchange) {
+        Map<String, String> p = new HashMap<>();
+        String query = exchange.getRequestURI().getRawQuery();
+        if (query == null) return p;
+        for (String par : query.split("&")) {
+            String[] kv = par.split("=", 2);
+            if (kv.length == 2) p.put(kv[0], URLDecoder.decode(kv[1], StandardCharsets.UTF_8).trim());
+        }
+        return p;
+    }
+
+    private static void responderTexto(HttpExchange exchange, String texto) throws IOException {
+        responder(exchange, 200, "text/plain; charset=UTF-8", texto.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static void responder(HttpExchange exchange, int codigo, String tipo, byte[] cuerpo) throws IOException {
+        exchange.getResponseHeaders().add("Content-Type", tipo);
+        exchange.sendResponseHeaders(codigo, cuerpo.length);
+        try (OutputStream os = exchange.getResponseBody()) {
+            os.write(cuerpo);
+        }
     }
 }

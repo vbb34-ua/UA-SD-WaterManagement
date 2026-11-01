@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WaterManagement Central</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+
+<!-- ============================ HEADER ============================ -->
+<header class="topbar">
+    <div class="brand">
+        <div class="brand-sub">Sample City · Parks &amp; Gardens Network</div>
+        <h1>WaterManagement <span>Central</span></h1>
+    </div>
+
+    <!-- Counters per status (click = filter the Stations view) -->
+    <div class="kpis" id="kpis"></div>
+
+    <div class="conn" id="conn" title="Real-time link with CENTRAL">
+        <span class="conn-dot"></span><span class="conn-text">Connecting…</span>
+    </div>
+</header>
+
+<nav class="tabs" role="tablist">
+    <button class="tab" data-view="monitoring" role="tab">Monitoring</button>
+    <button class="tab" data-view="stations" role="tab">Stations</button>
+    <button class="tab" data-view="control" role="tab">Control</button>
+    <button class="tab" data-view="events" role="tab">Events <span class="tab-badge" id="events-badge" hidden></span></button>
+</nav>
+
+<div class="banner" id="banner" hidden>Connection with CENTRAL lost. Reconnecting…</div>
+
+<main>
+    <!-- ======================= MONITORING ======================= -->
+    <section class="view" id="view-monitoring">
+        <div class="monitoring">
+            <div class="card map-card">
+                <div class="map-area" id="map-area"></div>
+                <div class="legend" id="legend"></div>
+            </div>
+
+            <aside class="side">
+                <div class="card">
+                    <h2 class="card-title">Active irrigations</h2>
+                    <div id="active-list" class="active-list"></div>
+                </div>
+                <div class="card">
+                    <h2 class="card-title">Attention</h2>
+                    <div id="alert-list" class="active-list"></div>
+                </div>
+                <div class="card grow">
+                    <h2 class="card-title">Latest events <a href="#events" class="link">View all</a></h2>
+                    <div id="recent-events" class="event-list compact"></div>
+                </div>
+            </aside>
+        </div>
+    </section>
+
+    <!-- ======================= STATIONS ======================= -->
+    <section class="view" id="view-stations">
+        <div class="card fill">
+            <div class="toolbar">
+                <div class="chips" id="status-filter"></div>
+                <input type="search" id="station-search" class="input" placeholder="Search ID or location">
+            </div>
+            <div class="table-wrap">
+                <table class="table">
+                    <thead>
+                        <tr>
+                            <th>Station</th>
+                            <th>Location</th>
+                            <th>Status</th>
+                            <th class="num">Flow (L/min)</th>
+                            <th class="num">Volume (L)</th>
+                            <th>Operator</th>
+                        </tr>
+                    </thead>
+                    <tbody id="stations-tbody"></tbody>
+                </table>
+                <div class="empty" id="stations-empty" hidden>No stations match the filter.</div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ======================= CONTROL ======================= -->
+    <section class="view" id="view-control">
+        <div class="control-grid">
+            <div class="card">
+                <h2 class="card-title">Commands to all stations</h2>
+                <p class="hint">Sent to every registered station. Disconnected or unavailable stations are skipped.</p>
+                <label class="field">
+                    <span>Irrigation time (s)</span>
+                    <input type="number" id="dur-all" class="input" min="1" max="3600" value="15">
+                </label>
+                <div class="btn-row">
+                    <button class="btn btn-green" id="btn-start-all">Start all</button>
+                    <button class="btn btn-orange" id="btn-block-all">Block all</button>
+                    <button class="btn btn-outline" id="btn-activate-all">Activate all</button>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2 class="card-title">Register station</h2>
+                <p class="hint">Only registered stations can authenticate with CENTRAL.</p>
+                <label class="field">
+                    <span>Station ID</span>
+                    <input type="text" id="new-ws-id" class="input" placeholder="WS_11">
+                </label>
+                <label class="field">
+                    <span>Location</span>
+                    <input type="text" id="new-ws-loc" class="input" list="zone-names" placeholder="Parque Central">
+                    <datalist id="zone-names"></datalist>
+                </label>
+                <button class="btn btn-green" id="btn-new-ws">Register station</button>
+            </div>
+
+            <div class="card">
+                <h2 class="card-title">Register operator</h2>
+                <p class="hint">Field operators must be registered to request irrigations.</p>
+                <label class="field">
+                    <span>Operator ID</span>
+                    <input type="text" id="new-op-id" class="input" placeholder="FO_11">
+                </label>
+                <button class="btn btn-green" id="btn-new-op">Register operator</button>
+            </div>
+        </div>
+    </section>
+
+    <!-- ======================= EVENTS ======================= -->
+    <section class="view" id="view-events">
+        <div class="card fill">
+            <div class="toolbar">
+                <div class="chips" id="event-filter"></div>
+                <input type="search" id="event-search" class="input" placeholder="Search events">
+            </div>
+            <div id="event-list" class="event-list scroll"></div>
+        </div>
+    </section>
+</main>
+
+<!-- ======================= STATION DRAWER ======================= -->
+<div class="drawer-backdrop" id="drawer-backdrop" hidden></div>
+<aside class="drawer" id="drawer" aria-hidden="true">
+    <div class="drawer-head">
+        <div>
+            <div class="drawer-id" id="d-id"></div>
+            <div class="drawer-loc" id="d-loc"></div>
+        </div>
+        <button class="icon-btn" id="d-close" aria-label="Close">✕</button>
+    </div>
+
+    <div class="pill big" id="d-status"></div>
+
+    <div class="metrics">
+        <div class="metric"><div class="metric-label">Flow</div><div class="metric-value" id="d-flow"></div></div>
+        <div class="metric"><div class="metric-label">Volume</div><div class="metric-value" id="d-vol"></div></div>
+        <div class="metric wide"><div class="metric-label">Operator</div><div class="metric-value" id="d-op"></div></div>
+    </div>
+
+    <ul class="checks" id="d-checks"></ul>
+
+    <div class="drawer-actions">
+        <label class="field" id="d-dur-field">
+            <span>Irrigation time (s)</span>
+            <input type="number" id="d-dur" class="input" min="1" max="3600" value="15">
+        </label>
+        <div class="btn-row">
+            <button class="btn btn-green" id="d-start">Start irrigation</button>
+            <button class="btn btn-orange" id="d-block">Block (Out of Service)</button>
+            <button class="btn btn-outline" id="d-activate">Activate</button>
+        </div>
+    </div>
+</aside>
+
+<div class="toasts" id="toasts"></div>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
