@@ -129,6 +129,11 @@
             border-radius: 50%;
         }
 
+        .zone-circle.has-stations {
+            background: rgba(16, 185, 129, 0.06);
+            border-color: rgba(16, 185, 129, 0.25);
+        }
+
         .zone-label {
             position: absolute;
             top: 20px;
@@ -441,19 +446,7 @@
         <!-- Map Area -->
         <div class="map-container">
             <div class="map-area" id="map-area">
-                <!-- Static Background Zones -->
-                <div class="zone-circle" style="width: 350px; height: 350px; top: 10%; left: 5%;">
-                    <div class="zone-label">River Park</div>
-                </div>
-                <div class="zone-circle" style="width: 300px; height: 300px; top: 5%; right: 10%;">
-                    <div class="zone-label">Riverside Gardens</div>
-                </div>
-                <div class="zone-circle" style="width: 400px; height: 400px; bottom: 5%; left: 10%;">
-                    <div class="zone-label">Central Park</div>
-                </div>
-                <div class="zone-circle" style="width: 250px; height: 250px; bottom: 10%; right: 5%;">
-                    <div class="zone-label">North Roundabout</div>
-                </div>
+                <!-- Zones and stations are drawn by layoutMap() -->
             </div>
             
             <div class="map-legend">
@@ -505,24 +498,103 @@
         let stationsData = {};
         let selectedStation = null;
 
-        // Pseudo-random fixed positions for nodes based on ID so they don't jump around
-        function getPositionForId(id) {
-            let hash = 0;
-            for (let i = 0; i < id.length; i++) hash = id.charCodeAt(i) + ((hash << 5) - hash);
-            // Zones: 0: TopLeft, 1: TopRight, 2: BottomLeft, 3: BottomRight
-            const zone = Math.abs(hash) % 4;
-            
-            let top, left;
-            const r1 = (Math.abs(hash * 31) % 40) + 20; // 20-60%
-            const r2 = (Math.abs(hash * 17) % 40) + 20;
-            
-            if (zone === 0) { top = r1; left = r2; }
-            else if (zone === 1) { top = r1; left = 50 + r2; }
-            else if (zone === 2) { top = 50 + r1; left = r2; }
-            else { top = 50 + r1; left = 50 + r2; }
-            
-            return { top: top + '%', left: left + '%' };
+        // ---------------------------------------------------------------- CITY MAP
+        // Known zones of the city. cx/cy: centre as a fraction of the map width/height.
+        // r: radius as a fraction of the smaller map side. aliases: accepted location names
+        // (compared without accents, case or spaces), in English and Spanish.
+        const ZONES = [
+            { key: 'river-park',        name: 'River Park',        cx: 0.17, cy: 0.32, r: 0.22,
+              aliases: ['river park', 'parque del rio', 'parque rio'] },
+            { key: 'central-park',      name: 'Central Park',      cx: 0.40, cy: 0.63, r: 0.30,
+              aliases: ['central park', 'parque central'] },
+            { key: 'riverside-gardens', name: 'Riverside Gardens', cx: 0.68, cy: 0.29, r: 0.24,
+              aliases: ['riverside gardens', 'jardines del rio', 'jardines rio', 'jardines de la ribera'] },
+            { key: 'north-roundabout',  name: 'North Roundabout',  cx: 0.85, cy: 0.71, r: 0.20,
+              aliases: ['north roundabout', 'rotonda norte'] }
+        ];
+
+        // Free spots for locations that are not one of the known zones
+        const EXTRA_SLOTS = [
+            { cx: 0.12, cy: 0.82 }, { cx: 0.60, cy: 0.88 }, { cx: 0.40, cy: 0.15 }, { cx: 0.92, cy: 0.20 }
+        ];
+        const EXTRA_RADIUS = 0.13;
+        const extraZones = {};   // normalized location -> zone
+
+        function normalize(text) {
+            return (text || '').normalize('NFD').replace(/[̀-ͯ]/g, '')
+                .toLowerCase().replace(/[^a-z0-9]/g, '');
         }
+
+        // Normalized alias -> zone
+        const ZONE_BY_ALIAS = {};
+        ZONES.forEach(z => z.aliases.forEach(a => ZONE_BY_ALIAS[normalize(a)] = z));
+
+        function zoneForLocation(location) {
+            const loc = normalize(location);
+            if (ZONE_BY_ALIAS[loc]) return ZONE_BY_ALIAS[loc];
+            // "Central Park - Sector B" also matches Central Park
+            for (const alias in ZONE_BY_ALIAS) {
+                if (alias && loc.includes(alias)) return ZONE_BY_ALIAS[alias];
+            }
+            // Unknown location: it gets its own zone in the next free spot
+            const key = loc || 'unassigned';
+            if (!extraZones[key]) {
+                const i = Object.keys(extraZones).length;
+                const slot = EXTRA_SLOTS[i % EXTRA_SLOTS.length];
+                const label = (!loc || ['sinubicacion', 'desconocida'].includes(loc)) ? 'Unassigned' : location;
+                extraZones[key] = { key: 'extra-' + i, name: label, cx: slot.cx, cy: slot.cy, r: EXTRA_RADIUS };
+            }
+            return extraZones[key];
+        }
+
+        // Draws the zones and places every station inside the zone of its location
+        function layoutMap() {
+            const W = mapArea.clientWidth, H = mapArea.clientHeight;
+            if (!W || !H) return;
+            const side = Math.min(W, H);
+
+            // Group stations by zone (sorted by id so positions are stable)
+            const groups = {};
+            Object.values(stationsData).sort((a, b) => a.id.localeCompare(b.id)).forEach(ws => {
+                const z = zoneForLocation(ws.location);
+                (groups[z.key] = groups[z.key] || { zone: z, stations: [] }).stations.push(ws);
+            });
+
+            // Zone circles: the known ones always, extra ones only when they have stations
+            const zonesToDraw = ZONES.concat(Object.values(extraZones).filter(z => groups[z.key]));
+            zonesToDraw.forEach(z => {
+                let circle = document.getElementById('zone-' + z.key);
+                if (!circle) {
+                    circle = document.createElement('div');
+                    circle.id = 'zone-' + z.key;
+                    circle.className = 'zone-circle';
+                    circle.innerHTML = '<div class="zone-label"></div>';
+                    mapArea.prepend(circle);
+                }
+                circle.querySelector('.zone-label').textContent = z.name;
+                const R = z.r * side;
+                circle.style.width = circle.style.height = (2 * R) + 'px';
+                circle.style.left = (z.cx * W - R) + 'px';
+                circle.style.top = (z.cy * H - R) + 'px';
+                circle.classList.toggle('has-stations', !!groups[z.key]);
+            });
+
+            // Stations: one in the centre, several spread on a ring inside the zone
+            Object.values(groups).forEach(({ zone, stations }) => {
+                const R = zone.r * side;
+                const ring = stations.length === 1 ? 0 : R * 0.5;
+                stations.forEach((ws, i) => {
+                    const node = document.getElementById(`node-${ws.id}`);
+                    if (!node) return;
+                    const angle = -Math.PI / 2 + (2 * Math.PI * i) / stations.length;
+                    node.style.left = (zone.cx * W + ring * Math.cos(angle)) + 'px';
+                    node.style.top = (zone.cy * H + R * 0.1 + ring * Math.sin(angle)) + 'px';
+                });
+            });
+        }
+
+        window.addEventListener('resize', layoutMap);
+        layoutMap();
 
         // SSE Connection
         const eventSource = new EventSource('/events');
@@ -554,9 +626,6 @@
                     node = document.createElement('div');
                     node.id = `node-${ws.id}`;
                     node.className = 'station-node';
-                    const pos = getPositionForId(ws.id);
-                    node.style.top = pos.top;
-                    node.style.left = pos.left;
                     node.onclick = () => selectStation(ws.id);
                     mapArea.appendChild(node);
                 }
@@ -581,6 +650,8 @@
                     <div class="status-text">${ws.id}${statusSuffix}</div>
                 `;
             });
+
+            layoutMap();
 
             // Update Header Counts
             document.getElementById('count-disp').innerText = counts.DISPONIBLE;
