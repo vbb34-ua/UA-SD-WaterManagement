@@ -6,24 +6,54 @@ import java.io.FileReader;
 import java.io.IOException;
 import java.net.Socket;
 import java.text.SimpleDateFormat;
+import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Date;
 import java.util.List;
+import java.util.Properties;
 import java.util.Scanner;
 
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
+
+/**
+ * WM_FO - Aplicación del operario de campo.
+ *
+ *  - Socket con WM_Central: registro, solicitudes de riego (ACTIVAR) y notificaciones.
+ *  - Kafka (topic wm-eventos): telemetría en tiempo real de la WS que le está regando.
+ *
+ * Fichero de servicios: una línea por servicio, "ID_WS" o "ID_WS,segundos" (ej. "WS_01,20").
+ * Las líneas vacías o que empiezan por '#' se ignoran.
+ *
+ * Uso: java WM_FO <ip_broker:puerto> <id_operador> [ip_central] [puerto_central]
+ */
 public class WM_FO {
+
+    private static final String TOPIC_EVENTOS = "wm-eventos";
+    private static final int DURACION_DEFECTO_S = 15;
+    private static final long INTERVALO_PING_MS = 5000;
+    /** Central responde ACK a cada PING. Sin nada en 20 s, el socket está semiabierto. */
+    private static final int TIMEOUT_LECTURA_MS = 20000;
 
     private final String brokerAddress;
     private final String idOperador;
     private final String ipCentral;
     private final int puertoCentral;
 
-    private Socket socketCentral;
+    private volatile Socket socketCentral;
     private DataOutputStream salidaCentral;
     private DataInputStream entradaCentral;
+    private final Object lockEnvio = new Object();
+    private volatile long ultimoEnvioMs = 0;
 
     private volatile boolean enEjecucion = true;
     private volatile boolean registradoEnCentral = false;
+
+    /** Estación que está prestando servicio a este operario (para filtrar la telemetría de Kafka). */
+    private volatile String wsEnServicio = null;
 
     private boolean servicioConcluido = false;
     private String ultimoMensajeConclusion = "";
@@ -45,94 +75,113 @@ public class WM_FO {
         System.out.println("===============================================================");
         System.out.println("   WATER MANAGEMENT - FIELD OPERATOR (WM_FO)");
         System.out.println("   Operador ID: [" + idOperador + "] | Broker: [" + brokerAddress + "]");
+        System.out.println("   Central: [" + ipCentral + ":" + puertoCentral + "]");
         System.out.println("===============================================================");
 
-        // Estrategia 1: Hilo de conexión y reconexión continua a la Central
+        // Estrategia 1: conexión y reconexión continua a la Central
         new Thread(this::gestorConexionCentral, "Hilo-Conexion-Central").start();
 
-        new Thread(this::hiloConsumidorBroker, "Hilo-Broker").start();
+        // Estrategia 2: latido para que Central no cierre la sesión por inactividad
+        new Thread(this::buclePing, "Hilo-Ping-Central").start();
+
+        // Telemetría de la WS en servicio a través de Kafka
+        new Thread(this::hiloConsumidorBroker, "Hilo-Kafka-Consumidor").start();
 
         menuPrincipal();
     }
 
-    // Estrategia 1: Reconexión periódica y re-autenticación automática
+    // ---------------------------------------------------------------- CONEXIÓN CON CENTRAL
+
+    // Estrategia 1: reconexión con backoff (2, 4, 8 ... 30 s) y re-autenticación automática
     private void gestorConexionCentral() {
         int esperaMs = 2000;
-        int maxEsperaMs = 30000;
+        final int maxEsperaMs = 30000;
 
         while (enEjecucion) {
-            if (!registradoEnCentral) {
-                boolean exito = conectarYRegistrarEnCentral();
-                if (exito) {
-                    registradoEnCentral = true;
-                    esperaMs = 2000;
-                    bucleEscuchaCentral(); // Escuchar hasta desconexión
-                } else {
-                    System.err.println("[OPERADOR] Reintentando conexión con Central en " + (esperaMs / 1000) + "s...");
-                    dormir(esperaMs);
-                    esperaMs = Math.min(esperaMs * 2, maxEsperaMs);
-                }
-            } else {
-                dormir(1000);
+            if (conectarYRegistrarEnCentral()) {
+                esperaMs = 2000;
+                bucleEscuchaCentral(); // Hasta que se pierda la conexión
             }
+            if (!enEjecucion) break;
+            System.err.println("[OPERADOR] Reintentando conexión con Central en " + (esperaMs / 1000) + " s...");
+            dormir(esperaMs);
+            esperaMs = Math.min(esperaMs * 2, maxEsperaMs);
         }
     }
 
     private boolean conectarYRegistrarEnCentral() {
         try {
             System.out.println("[OPERADOR] Conectando a WM_Central (" + ipCentral + ":" + puertoCentral + ")...");
-            socketCentral = new Socket(ipCentral, puertoCentral);
-            salidaCentral = new DataOutputStream(socketCentral.getOutputStream());
-            entradaCentral = new DataInputStream(socketCentral.getInputStream());
+            Socket s = new Socket(ipCentral, puertoCentral);
+            s.setSoTimeout(TIMEOUT_LECTURA_MS);
+            synchronized (lockEnvio) {
+                salidaCentral = new DataOutputStream(s.getOutputStream());
+                entradaCentral = new DataInputStream(s.getInputStream());
+                socketCentral = s;
+            }
 
             enviarTrama("REGISTRO_OPERARIO#" + idOperador);
-
             String respuesta = entradaCentral.readUTF();
-            boolean aceptado = respuesta != null && respuesta.contains(String.valueOf(ACK));
 
-            if (aceptado) {
+            if (respuesta.equals(String.valueOf(ACK))) {
+                registradoEnCentral = true;
                 System.out.println("[OPERADOR] ¡Registro exitoso en WM_Central! (ACK recibido)");
+                System.out.print("> ");
                 return true;
-            } else {
-                System.err.println("[OPERADOR] Registro rechazado por Central (NACK).");
-                return false;
             }
+
+            String motivo = respuesta.length() > 1 ? respuesta.substring(1) : "NACK";
+            cerrarConexion();
+            if ("OPERARIO_NO_REGISTRADO".equals(motivo) || "ID_INVALIDO".equals(motivo)) {
+                System.err.println("[OPERADOR] CENTRAL rechaza al operario [" + idOperador + "]: no está dado de alta. Saliendo.");
+                System.exit(1);
+            }
+            System.err.println("[OPERADOR] Registro rechazado por Central (" + motivo + ").");
+            return false;
         } catch (IOException e) {
             System.err.println("[OPERADOR] Fallo al conectar con WM_Central: " + e.getMessage());
+            cerrarConexion();
             return false;
         }
     }
 
     private void bucleEscuchaCentral() {
-        while (enEjecucion && registradoEnCentral) {
-            try {
+        try {
+            while (enEjecucion) {
                 String mensaje = entradaCentral.readUTF();
-                if (mensaje == null) break;
-
+                if (mensaje.length() == 1 && (mensaje.charAt(0) == ACK || mensaje.charAt(0) == NACK)) {
+                    continue; // Respuestas a PING
+                }
                 imprimirMensajeCentral(mensaje);
 
                 if (esFinDeServicio(mensaje)) {
-                    synchronized (lockServicio) {
-                        servicioConcluido = true;
-                        ultimoMensajeConclusion = mensaje;
-                        lockServicio.notifyAll();
-                    }
+                    concluirServicio(mensaje);
                 }
-            } catch (IOException e) {
-                System.err.println("\n[OPERADOR] Conexión perdida con WM_Central.");
-                registradoEnCentral = false;
-                break;
             }
+        } catch (IOException e) {
+            if (enEjecucion) System.err.println("\n[OPERADOR] Conexión perdida con WM_Central: " + e.getMessage());
+        } finally {
+            registradoEnCentral = false;
+            cerrarConexion();
+            // Si se esperaba la conclusión de un servicio, no se puede seguir esperando
+            if (wsEnServicio != null) concluirServicio("ERROR: Conexión con CENTRAL perdida durante el servicio");
+        }
+    }
+
+    private void concluirServicio(String mensaje) {
+        wsEnServicio = null;
+        synchronized (lockServicio) {
+            servicioConcluido = true;
+            ultimoMensajeConclusion = mensaje;
+            lockServicio.notifyAll();
         }
     }
 
     private boolean esFinDeServicio(String msg) {
-        if (msg == null) return false;
         return msg.startsWith("RESUMEN_FIN_RIEGO:") ||
                 msg.startsWith("DENEGADO:") ||
                 msg.startsWith("ERROR:") ||
-                msg.startsWith("ABORTADO:") ||
-                msg.equals(String.valueOf(NACK));
+                msg.startsWith("ABORTADO:");
     }
 
     private void imprimirMensajeCentral(String msg) {
@@ -147,7 +196,7 @@ public class WM_FO {
             System.out.println(">>> [" + hora + "] [RESUMEN FINAL DE RIEGO]");
             System.out.println("    " + msg.replace("RESUMEN_FIN_RIEGO:", "").trim());
             System.out.println("=======================================================");
-        } else if (msg.startsWith("LISTA_ESTACIONES:") || msg.startsWith("ESTACIONES:")) {
+        } else if (msg.startsWith("LISTA_ESTACIONES:")) {
             System.out.println("\n--- ESTADO DE ESTACIONES EN CENTRAL ---" + msg.substring(msg.indexOf(':') + 1));
             System.out.println("---------------------------------------");
         } else {
@@ -156,8 +205,11 @@ public class WM_FO {
         System.out.print("> ");
     }
 
-    private synchronized void enviarTrama(String datos) throws IOException {
-        if (salidaCentral != null && socketCentral != null && !socketCentral.isClosed()) {
+    private void enviarTrama(String datos) throws IOException {
+        synchronized (lockEnvio) {
+            if (salidaCentral == null || socketCentral == null || socketCentral.isClosed()) {
+                throw new IOException("Socket no disponible");
+            }
             String mensaje = STX + datos + ETX;
             char lrc = 0;
             for (int i = 0; i < mensaje.length(); i++) {
@@ -165,21 +217,78 @@ public class WM_FO {
             }
             salidaCentral.writeUTF(mensaje + lrc);
             salidaCentral.flush();
-        } else {
-            throw new IOException("Socket no disponible");
+            ultimoEnvioMs = System.currentTimeMillis();
         }
     }
 
-    public void solicitarRiego(String idWs) {
+    // Estrategia 2: ping a Central cuando no hay tráfico
+    private void buclePing() {
+        while (enEjecucion) {
+            dormir(1000);
+            if (registradoEnCentral && System.currentTimeMillis() - ultimoEnvioMs >= INTERVALO_PING_MS) {
+                try {
+                    enviarTrama("PING#" + idOperador);
+                } catch (IOException ignored) {}
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- KAFKA
+
+    private void hiloConsumidorBroker() {
+        Properties props = new Properties();
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, brokerAddress);
+        props.put(ConsumerConfig.GROUP_ID_CONFIG, "fo-" + idOperador);
+        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.StringDeserializer");
+        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.StringDeserializer");
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "latest");
+
+        while (enEjecucion) {
+            try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props)) {
+                consumer.subscribe(Collections.singletonList(TOPIC_EVENTOS));
+                System.out.println("[OPERADOR] Suscrito a Kafka '" + TOPIC_EVENTOS + "' para recibir la telemetría.");
+                while (enEjecucion) {
+                    ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(1000));
+                    for (ConsumerRecord<String, String> r : records) {
+                        procesarEventoKafka(r);
+                    }
+                }
+            } catch (Exception e) {
+                System.err.println("[OPERADOR] Error en el consumidor Kafka: " + e.getMessage() + ". Reintentando en 5 s...");
+                dormir(5000);
+            }
+        }
+    }
+
+    private void procesarEventoKafka(ConsumerRecord<String, String> r) {
+        if (r.value() == null || System.currentTimeMillis() - r.timestamp() > 10000) return;
+        String ws = wsEnServicio;
+        if (ws == null || !ws.equals(r.key())) return; // Solo la WS que presta servicio a este operario
+
+        String[] p = r.value().split("#", -1);
+        // TELEMETRIA#ws#operario#caudal#volumen
+        if ("TELEMETRIA".equals(p[0]) && p.length >= 5 && idOperador.equals(p[2])) {
+            System.out.println("[" + new SimpleDateFormat("HH:mm:ss").format(new Date()) + "] [KAFKA] " + ws
+                    + " regando | Caudal: " + p[3] + " L/min | Volumen acumulado: " + p[4] + " L");
+        }
+    }
+
+    // ---------------------------------------------------------------- SERVICIOS
+
+    public boolean solicitarRiego(String idWs, int duracion) {
         try {
-            System.out.println("\n[OPERADOR] Enviando solicitud de riego para WS [" + idWs + "]...");
+            System.out.println("\n[OPERADOR] Enviando solicitud de riego para WS [" + idWs + "] (" + duracion + " s)...");
             synchronized (lockServicio) {
                 servicioConcluido = false;
                 ultimoMensajeConclusion = "";
             }
-            enviarTrama("ACTIVAR#" + idWs + "#" + idOperador);
+            wsEnServicio = idWs;
+            enviarTrama("ACTIVAR#" + idWs + "#" + idOperador + "#" + duracion);
+            return true;
         } catch (IOException e) {
+            wsEnServicio = null;
             System.err.println("[OPERADOR] Error al solicitar activación (Sin conexión con Central): " + e.getMessage());
+            return false;
         }
     }
 
@@ -191,14 +300,13 @@ public class WM_FO {
         }
 
         System.out.println("\n[MODO AUTOMÁTICO] Cargando servicios desde: " + rutaFichero);
-        List<String> estaciones = new ArrayList<>();
+        List<String[]> servicios = new ArrayList<>();
         try (BufferedReader br = new BufferedReader(new FileReader(archivo))) {
             String linea;
             while ((linea = br.readLine()) != null) {
                 linea = linea.trim();
                 if (!linea.isEmpty() && !linea.startsWith("#")) {
-                    String idWs = linea.split("[,#\\s]+")[0].trim();
-                    estaciones.add(idWs);
+                    servicios.add(linea.split("[,;\\s]+"));
                 }
             }
         } catch (IOException e) {
@@ -206,39 +314,47 @@ public class WM_FO {
             return;
         }
 
-        for (int i = 0; i < estaciones.size(); i++) {
-            if (!enEjecucion) break;
-
-            String idWs = estaciones.get(i);
-            System.out.println("\n[SERVICIO " + (i + 1) + "/" + estaciones.size() + "] Activando estación: " + idWs);
-
-            solicitarRiego(idWs);
-
-            String resultadoServicio;
-            synchronized (lockServicio) {
-                long tiempoInicio = System.currentTimeMillis();
-                long timeoutMaximo = 60000;
-                while (!servicioConcluido && enEjecucion) {
-                    try {
-                        long transcurrido = System.currentTimeMillis() - tiempoInicio;
-                        if (transcurrido >= timeoutMaximo) {
-                            System.err.println("[OPERADOR] Timeout esperando conclusión de servicio " + idWs);
-                            break;
-                        }
-                        lockServicio.wait(timeoutMaximo - transcurrido);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        break;
-                    }
-                }
-                resultadoServicio = ultimoMensajeConclusion;
+        for (int i = 0; i < servicios.size() && enEjecucion; i++) {
+            String idWs = servicios.get(i)[0].trim();
+            int duracion = DURACION_DEFECTO_S;
+            if (servicios.get(i).length > 1) {
+                try { duracion = Integer.parseInt(servicios.get(i)[1].trim()); } catch (NumberFormatException ignored) {}
             }
+            System.out.println("\n[SERVICIO " + (i + 1) + "/" + servicios.size() + "] Activando estación: " + idWs);
 
-            System.out.println("[MODO AUTOMÁTICO] Servicio en " + idWs + " concluido: " + resultadoServicio);
+            String resultado;
+            if (!solicitarRiego(idWs, duracion)) {
+                resultado = "ERROR: sin conexión con CENTRAL";
+            } else {
+                resultado = esperarConclusion(duracion * 1000L + 60000L);
+            }
+            System.out.println("[MODO AUTOMÁTICO] Servicio en " + idWs + " concluido: " + resultado);
 
-            if (i < estaciones.size() - 1 && enEjecucion) {
+            if (i < servicios.size() - 1 && enEjecucion) {
+                System.out.println("[MODO AUTOMÁTICO] Esperando 4 s antes del siguiente servicio...");
                 dormir(4000);
             }
+        }
+        System.out.println("[MODO AUTOMÁTICO] Todos los servicios del fichero han sido procesados.");
+    }
+
+    private String esperarConclusion(long timeoutMs) {
+        synchronized (lockServicio) {
+            long inicio = System.currentTimeMillis();
+            while (!servicioConcluido && enEjecucion) {
+                long restante = timeoutMs - (System.currentTimeMillis() - inicio);
+                if (restante <= 0) {
+                    wsEnServicio = null;
+                    return "TIMEOUT esperando la conclusión del servicio";
+                }
+                try {
+                    lockServicio.wait(restante);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            return ultimoMensajeConclusion;
         }
     }
 
@@ -250,15 +366,12 @@ public class WM_FO {
         }
     }
 
-    private void hiloConsumidorBroker() {
-        System.out.println("[OPERADOR] Hilo consumidor del Broker (" + brokerAddress + ") iniciado.");
-    }
-
     private void menuPrincipal() {
         try (Scanner scanner = new Scanner(System.in)) {
             while (enEjecucion) {
                 System.out.println("\n-------------------------------------------");
-                System.out.println("   PANEL DE OPERARIO - ID: " + idOperador);
+                System.out.println("   PANEL DE OPERARIO - ID: " + idOperador
+                        + (registradoEnCentral ? " (conectado)" : " (SIN CONEXIÓN)"));
                 System.out.println("-------------------------------------------");
                 System.out.println("[1] Solicitar activación puntual de riego (Manual)");
                 System.out.println("[2] Cargar y ejecutar servicios desde archivo");
@@ -266,13 +379,18 @@ public class WM_FO {
                 System.out.println("[4] Salir");
                 System.out.print("Seleccione una opción: ");
 
+                if (!scanner.hasNextLine()) break;
                 String opcion = scanner.nextLine().trim();
 
                 switch (opcion) {
                     case "1":
                         System.out.print("ID de estación (ej. WS_01): ");
                         String idWs = scanner.nextLine().trim();
-                        if (!idWs.isEmpty()) solicitarRiego(idWs);
+                        System.out.print("Duración en segundos [" + DURACION_DEFECTO_S + "]: ");
+                        String dur = scanner.nextLine().trim();
+                        int duracion = DURACION_DEFECTO_S;
+                        try { if (!dur.isEmpty()) duracion = Integer.parseInt(dur); } catch (NumberFormatException ignored) {}
+                        if (!idWs.isEmpty()) solicitarRiego(idWs, duracion);
                         break;
 
                     case "2":
@@ -300,12 +418,15 @@ public class WM_FO {
     }
 
     private void cerrarConexion() {
-        try {
-            if (socketCentral != null && !socketCentral.isClosed()) socketCentral.close();
-        } catch (IOException ignored) {}
+        synchronized (lockEnvio) {
+            try {
+                if (socketCentral != null) socketCentral.close();
+            } catch (IOException ignored) {}
+            socketCentral = null;
+        }
     }
 
-    private void dormir(int ms) {
+    private void dormir(long ms) {
         try { Thread.sleep(ms); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
     }
 
@@ -333,7 +454,6 @@ public class WM_FO {
             }
         }
 
-        WM_FO fo = new WM_FO(broker, idOperador, ipCentral, puertoCentral);
-        fo.iniciar();
+        new WM_FO(broker, idOperador, ipCentral, puertoCentral).iniciar();
     }
 }

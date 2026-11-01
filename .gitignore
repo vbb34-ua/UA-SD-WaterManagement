@@ -26,3 +26,7 @@ CoreSystem/src/main/java/*.class
 WaterManagement/Water_Station/*.class
 WaterManagement/Target/classes/*.class
 Water_Station/target/*
+# Water Station: clases compiladas, BDs locales y variables de entorno del laboratorio
+Water_Station/*.class
+*.db
+Water_Station/.env

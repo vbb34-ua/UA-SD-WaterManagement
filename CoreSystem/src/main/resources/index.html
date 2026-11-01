@@ -338,6 +338,43 @@
 
         .btn-block:hover { background: rgba(245, 158, 11, 0.2); }
 
+        .action-buttons.three { grid-template-columns: 1fr 1fr 1fr; }
+
+        .duration-row {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            margin-bottom: 0.5rem;
+            font-size: 0.75rem;
+            color: var(--text-muted);
+        }
+
+        .duration-row input {
+            width: 5rem;
+            padding: 0.35rem 0.5rem;
+            border-radius: 6px;
+            border: 1px solid rgba(100, 116, 139, 0.4);
+            background: transparent;
+            color: var(--text-main);
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .operator-line {
+            font-size: 0.8rem;
+            margin-bottom: 0.75rem;
+            color: var(--text-muted);
+        }
+
+        .operator-line strong { color: var(--color-watering); }
+
+        /* Watering stations blink (green) */
+        @keyframes blink-anim {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.25; }
+        }
+        .station-node .color-REGANDO,
+        .status-badge.border-REGANDO { animation: blink-anim 1s infinite; }
+
         /* Logs List */
         .logs-list {
             display: flex;
@@ -438,6 +475,20 @@
             </div>
 
             <div>
+                <h3 class="section-title">ALL STATIONS</h3>
+                <div class="details-card">
+                    <div class="duration-row">
+                        Duration (s): <input type="number" id="dur-all" min="1" max="3600" value="15">
+                    </div>
+                    <div class="action-buttons three">
+                        <button class="btn-start" onclick="sendAction('ALL', 'START', 'dur-all')">Start all</button>
+                        <button class="btn-block" onclick="sendAction('ALL', 'BLOCK')">Block all</button>
+                        <button class="btn-start" style="border-color: #34d399; color: #34d399;" onclick="sendAction('ALL', 'ACTIVATE')">Activate all</button>
+                    </div>
+                </div>
+            </div>
+
+            <div>
                 <h3 class="section-title">RECENT EVENTS</h3>
                 <div class="logs-list" id="logs-container">
                     <!-- Logs go here -->
@@ -518,6 +569,8 @@
                     ripples = `<div class="ripple"></div><div class="ripple"></div><div class="ripple"></div>`;
                 } else if (ws.estado === "FUGA") {
                     statusSuffix = " • leak!";
+                } else if (ws.estado === "FUERA_SERVICIO") {
+                    statusSuffix = " • Fuera de Servicio";
                 }
 
                 node.innerHTML = `
@@ -556,6 +609,10 @@
         }
 
         function updateDetailsPanel(ws) {
+            // Keep the duration typed by the user when the panel re-renders
+            const durInput = document.getElementById('dur-one');
+            const prevDur = (durInput && durInput.value) ? durInput.value : 15;
+
             const statusNames = {
                 'DISPONIBLE': 'Available',
                 'REGANDO': 'Watering',
@@ -572,6 +629,10 @@
                     </div>
                     <div class="status-badge border-${ws.estado}">${statusNames[ws.estado]}</div>
                 </div>
+
+                ${ws.estado === 'REGANDO'
+                    ? `<div class="operator-line">Activated by operator: <strong>${ws.operario}</strong></div>`
+                    : ''}
 
                 <div class="metrics-grid">
                     <div class="metric-box">
@@ -590,9 +651,13 @@
                     <li><div class="dot color-${ws.estado === 'DESCONECTADA' ? 'DESCONECTADA' : 'DISPONIBLE'}"></div> Connection: ${ws.estado === 'DESCONECTADA' ? 'lost' : 'active'}</li>
                 </ul>
 
+                ${ws.estado === 'DISPONIBLE'
+                    ? `<div class="duration-row">Duration (s): <input type="number" id="dur-one" min="1" max="3600" value="${prevDur}"></div>`
+                    : ''}
+
                 <div class="action-buttons">
-                    ${ws.estado === 'DISPONIBLE' 
-                        ? `<button class="btn-start" onclick="sendAction('${ws.id}', 'START')"><div class="dot color-DISPONIBLE"></div> Start watering</button>` 
+                    ${ws.estado === 'DISPONIBLE'
+                        ? `<button class="btn-start" onclick="sendAction('${ws.id}', 'START', 'dur-one')"><div class="dot color-DISPONIBLE"></div> Start watering</button>`
                         : ''}
                     
                     ${ws.estado === 'FUERA_SERVICIO'
@@ -602,8 +667,13 @@
             `;
         }
 
-        function sendAction(id, action) {
-            fetch('/api/action?ws=' + id + '&action=' + action)
+        function sendAction(id, action, durInputId) {
+            let url = '/api/action?ws=' + encodeURIComponent(id) + '&action=' + action;
+            if (durInputId) {
+                const input = document.getElementById(durInputId);
+                if (input && input.value) url += '&dur=' + encodeURIComponent(input.value);
+            }
+            fetch(url)
                 .then(r => r.text())
                 .then(res => {
                     if (res !== 'OK') console.error('Action failed:', res);

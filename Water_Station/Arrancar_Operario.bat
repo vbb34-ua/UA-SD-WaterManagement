@@ -1,6 +1,47 @@
 @echo off
 chcp 65001 > nul
 cd /d "%~dp0"
+
+REM --- AUTO-DETECCION DE JAVA ---
+where javac >nul 2>nul
+if %errorlevel% equ 0 goto :java_ok
+
+if defined JAVA_HOME (
+    set "PATH=%JAVA_HOME%\bin;%PATH%"
+    where javac >nul 2>nul
+    if %errorlevel% equ 0 goto :java_ok
+)
+
+REM Buscar en rutas tipicas de instalacion de Windows
+for %%D in (
+    "%ProgramFiles%\Eclipse Adoptium"
+    "%ProgramFiles%\Java"
+    "%ProgramFiles%\Microsoft"
+    "%ProgramFiles(x86)%\Java"
+    "%LocalAppData%\Programs\Eclipse Adoptium"
+) do (
+    if exist %%D (
+        for /f "delims=" %%J in ('dir /b /ad /o-n %%D 2^>nul') do (
+            if exist "%%~D\%%J\bin\javac.exe" (
+                set "JAVA_HOME=%%~D\%%J"
+                set "PATH=%%~D\%%J\bin;%PATH%"
+                echo [INFO] Java encontrado en: %%~D\%%J
+                goto :java_ok
+            )
+        )
+    )
+)
+
+echo ==============================================================
+echo   ERROR: No se encontro javac (compilador de Java).
+echo   Instala un JDK (ej. Eclipse Temurin) desde:
+echo   https://adoptium.net/
+echo   O configura la variable JAVA_HOME.
+echo ==============================================================
+pause
+exit /b 1
+
+:java_ok
 echo ==============================================================
 echo   COMPILANDO OPERARIO (MODO PORTABLE)...
 echo ==============================================================

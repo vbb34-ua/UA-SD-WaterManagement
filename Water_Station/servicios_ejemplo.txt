@@ -1,0 +1,6 @@
+# Fichero de servicios para WM_FO (opción 2 del menú)
+# Formato: ID_WS[,segundos]   (si no se indica la duración se usan 15 s)
+# Tras cada servicio (éxito o fracaso) el operario espera 4 s antes de pedir el siguiente.
+WS_01,10
+WS_02,8
+WS_01

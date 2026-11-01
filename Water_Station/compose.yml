@@ -1,0 +1,50 @@
+# Despliegue de LABORATORIO (Figura 4 del enunciado).
+# CENTRAL y KAFKA están en Railway: rellenad las variables en un fichero .env junto a este compose:
+#
+#   CENTRAL_HOST=xxxx.proxy.rlwy.net     # TCP Proxy de WM_Central (puerto de sockets)
+#   CENTRAL_PORT=12345
+#   KAFKA_BROKER=yyyy.proxy.rlwy.net:38689
+#
+# PC LAB 2 (estaciones):  docker compose up -d monitor-ws1 engine-ws1 monitor-ws2 engine-ws2
+# PC LAB 1 (operarios):   docker compose up -d fo1 fo2
+# Para interactuar con un módulo (menú):  docker attach <contenedor>   (salir sin pararlo: Ctrl+P, Ctrl+Q)
+
+x-lab: &lab
+  build: .
+  image: wm-lab
+  stdin_open: true
+  tty: true
+  restart: unless-stopped
+
+services:
+  monitor-ws1:
+    <<: *lab
+    container_name: monitor-ws1
+    command: ["WM_WS_M", "7000", "${CENTRAL_HOST}", "${CENTRAL_PORT}", "WS_01", "Parque Central"]
+
+  engine-ws1:
+    <<: *lab
+    container_name: engine-ws1
+    command: ["WM_WS_E", "${KAFKA_BROKER}", "monitor-ws1", "7000", "WS_01"]
+    depends_on: [monitor-ws1]
+
+  monitor-ws2:
+    <<: *lab
+    container_name: monitor-ws2
+    command: ["WM_WS_M", "7000", "${CENTRAL_HOST}", "${CENTRAL_PORT}", "WS_02", "Jardines del Río"]
+
+  engine-ws2:
+    <<: *lab
+    container_name: engine-ws2
+    command: ["WM_WS_E", "${KAFKA_BROKER}", "monitor-ws2", "7000", "WS_02"]
+    depends_on: [monitor-ws2]
+
+  fo1:
+    <<: *lab
+    container_name: fo1
+    command: ["WM_FO", "${KAFKA_BROKER}", "FO_01", "${CENTRAL_HOST}", "${CENTRAL_PORT}"]
+
+  fo2:
+    <<: *lab
+    container_name: fo2
+    command: ["WM_FO", "${KAFKA_BROKER}", "FO_02", "${CENTRAL_HOST}", "${CENTRAL_PORT}"]

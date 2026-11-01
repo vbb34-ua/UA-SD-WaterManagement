@@ -1,53 +1,72 @@
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.EOFException;
-import java.io.InputStream;
-import java.io.OutputStream;
+import java.io.IOException;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 
+/**
+ * Hilo que atiende una conexión de socket con CENTRAL: un Monitor de WS (WM_WS_M)
+ * o una aplicación de operario (WM_FO).
+ *
+ * Protocolo: <STX>CODIGO#campo1#...#campoN<ETX><LRC>, LRC = XOR de todos los bytes
+ * desde STX hasta ETX. CENTRAL responde con <ACK> o <NACK>.
+ */
 public class WM_Central_Thread extends Thread {
 
-    private Socket skCliente;
-    public static java.util.concurrent.ConcurrentHashMap<String, WM_Central_Thread> conexiones = new java.util.concurrent.ConcurrentHashMap<>();
-    private String idConexion = null;
+    private enum Tipo { DESCONOCIDO, ESTACION, OPERARIO }
 
     private static final char STX = 0x02;
     private static final char ETX = 0x03;
     private static final char ACK = 0x06;
     private static final char NACK = 0x15;
 
+    /** Estrategia 2: si en 15 s no llega nada (telemetría, ping...) la conexión se da por caída. */
+    private static final int TIMEOUT_LECTURA_MS = 15000;
+
+    private final Socket skCliente;
+    private DataInputStream entrada;
+    private DataOutputStream salida;
+
+    private Tipo tipo = Tipo.DESCONOCIDO;
+    private String idConexion = null;
+    private volatile long ultimaActividadMs = System.currentTimeMillis();
+
     public WM_Central_Thread(Socket p_cliente) {
         this.skCliente = p_cliente;
     }
-    
-    public String leeSocket(Socket p_sk) throws SocketTimeoutException, EOFException, Exception {
-        InputStream aux = p_sk.getInputStream();
-        DataInputStream flujo = new DataInputStream(aux);
-        return flujo.readUTF();
-    }
 
-    public void escribeSocket(Socket p_sk, String p_Datos) {
+    // ---------------------------------------------------------------- E/S
+
+    private synchronized void escribeSocket(String datos) {
         try {
-            OutputStream aux = p_sk.getOutputStream();
-            DataOutputStream flujo = new DataOutputStream(aux);
-            flujo.writeUTF(p_Datos);      
+            salida.writeUTF(datos);
+            salida.flush();
         } catch (Exception e) {
-            System.out.println("Error escribiendo en socket: " + e.getMessage());
+            System.out.println("Error escribiendo en socket [" + idConexion + "]: " + e.getMessage());
         }
     }
 
+    /** Trama con formato STX/ETX/LRC (hacia los Monitores). */
     public void enviarTrama(String datos) {
         String mensaje = STX + datos + ETX;
-        char lrc = calcularLRC(mensaje);
-        escribeSocket(skCliente, mensaje + lrc);
+        escribeSocket(mensaje + calcularLRC(mensaje));
     }
-    
-    public void enviarTextoOperario(String texto) {
-        escribeSocket(skCliente, texto);
+
+    /** Texto plano informativo (hacia las aplicaciones de operario). */
+    public void enviarTexto(String texto) {
+        escribeSocket(texto);
     }
-    
-    private char calcularLRC(String mensaje) {
+
+    public long msDesdeUltimaActividad() {
+        return System.currentTimeMillis() - ultimaActividadMs;
+    }
+
+    public void cerrar() {
+        try { skCliente.close(); } catch (IOException ignored) {}
+    }
+
+    private static char calcularLRC(String mensaje) {
         char lrc = 0;
         for (int i = 0; i < mensaje.length(); i++) {
             lrc ^= mensaje.charAt(i);
@@ -55,247 +74,149 @@ public class WM_Central_Thread extends Thread {
         return lrc;
     }
 
+    /** Valida STX/ETX/LRC y devuelve el campo DATA, o null si la trama es incorrecta. */
     private String procesarTrama(String trama) {
         if (trama == null || trama.length() < 3) return null;
         if (trama.charAt(0) != STX) return null;
 
         int etxIndex = trama.indexOf(ETX);
-        if (etxIndex == -1 || etxIndex == trama.length() - 1) return null;
+        if (etxIndex == -1 || etxIndex != trama.length() - 2) return null;
 
         char lrcRecibido = trama.charAt(trama.length() - 1);
-        String mensajeParaLRC = trama.substring(0, trama.length() - 1);
-        char lrcCalculado = calcularLRC(mensajeParaLRC);
-        
+        char lrcCalculado = calcularLRC(trama.substring(0, trama.length() - 1));
         if (lrcRecibido != lrcCalculado) {
-            System.out.println("SRV: Error de validación LRC.");
+            System.out.println("SRV: Error de validación LRC en trama de [" + idConexion + "].");
             return null;
         }
-
         return trama.substring(1, etxIndex);
     }
 
+    // ---------------------------------------------------------------- OPERACIONES
+
+    private static String ack() { return String.valueOf(ACK); }
+    private static String nack(String motivo) { return NACK + (motivo == null ? "" : motivo); }
+
+    private static int parseEntero(String s, int defecto) {
+        try { return Integer.parseInt(s.trim()); } catch (Exception e) { return defecto; }
+    }
+
+    /** Devuelve la respuesta que se envía al cliente (ACK/NACK) o null si no hay que responder. */
     private String ejecutarOperacion(String data) {
-        String[] partes = data.split("#");
+        String[] partes = data.split("#", -1);
         String operacion = partes[0];
 
         switch (operacion) {
             case "PING":
-                return String.valueOf(ACK);
+                return ack();
 
-            case "REGISTRO":
-                if (partes.length >= 3) {
-                    String id = partes[1];
-                    String location = partes[2];
-                    boolean exito = DatabaseManager.registrarEstacion(id, location);
-                    if (exito) {
-                        this.idConexion = id;
-                        conexiones.put(id, this);
-                        Dashboard.registrarEstacion(id, location);
-                        return String.valueOf(ACK);
-                    }
-                }
-                break;
-
-            case "REGISTRO_OPERARIO":
-                if (partes.length >= 2) {
-                    String idOp = partes[1];
-                    this.idConexion = idOp;
-                    conexiones.put(idOp, this);
-                    return String.valueOf(ACK);
-                }
-                break;
-
-            case "ACTIVAR":
-                if (partes.length >= 3) {
-                    String idWs = partes[1];
-                    String idOperario = partes[2];
-                    
-                    if (this.idConexion == null) {
-                        this.idConexion = idOperario;
-                        conexiones.put(idOperario, this);
-                    }
-                    
-                    Dashboard.log("Petición de activación para WS [" + idWs + "] por [" + idOperario + "].");
-                    enviarTextoOperario("PROCESANDO: Solicitando estado de " + idWs + "...");
-                    
-                    String estadoWS = DatabaseManager.obtenerEstado(idWs);
-                    if ("DISPONIBLE".equals(estadoWS)) {
-                        WM_Central_Thread hiloWS = conexiones.get(idWs);
-                        if (hiloWS != null) {
-                            hiloWS.enviarTrama("SOLICITUD_RIEGO#" + idOperario);
-                        } else {
-                            enviarTextoOperario("ERROR: La estación " + idWs + " está desconectada del socket.");
-                        }
-                    } else {
-                        enviarTextoOperario("DENEGADO: La estación " + idWs + " se encuentra en estado " + estadoWS);
-                    }
-                    return null;
-                }
-                break;
-
+            // ---------------- Mensajes de los MONITORES (WM_WS_M)
+            case "REGISTRO": {
+                if (partes.length < 3 || tipo == Tipo.OPERARIO) return nack("FORMATO");
+                String id = partes[1].trim();
+                String location = partes[2].trim().isEmpty() ? "Sin ubicación" : partes[2].trim();
+                String error = GestorRiegos.registrarEstacion(id, location, this);
+                if (error != null) return nack(error);
+                this.tipo = Tipo.ESTACION;
+                this.idConexion = id;
+                return ack();
+            }
             case "RIEGO_AUTORIZADO":
-                if (partes.length >= 2) {
-                    String idOperario = partes[1];
-                    String idWs = this.idConexion;
-                    
-                    Dashboard.log("WS [" + idWs + "] AUTORIZA el riego. Riego en curso.");
-                    DatabaseManager.actualizarEstado(idWs, "REGANDO");
-                    Dashboard.actualizarEstado(idWs, Dashboard.Estado.REGANDO);
-                    Dashboard.asignarOperario(idWs, idOperario);
+                if (tipo != Tipo.ESTACION || partes.length < 2) return nack("NO_REGISTRADO");
+                GestorRiegos.riegoAutorizado(idConexion, partes[1]);
+                return ack();
 
-                    KafkaManager.publicarEvento("INICIO_RIEGO", idWs + "#" + idOperario);
-
-                    WM_Central_Thread hiloOperario = conexiones.get(idOperario);
-                    if (hiloOperario != null) {
-                        hiloOperario.enviarTextoOperario("AUTORIZADO: El riego ha comenzado en " + idWs);
-                    }
-                    return String.valueOf(ACK);
-                }
-                break;
+            case "RIEGO_DENEGADO":
+                if (tipo != Tipo.ESTACION || partes.length < 2) return nack("NO_REGISTRADO");
+                GestorRiegos.riegoDenegado(idConexion, partes[1], partes.length >= 3 ? partes[2] : "sin motivo");
+                return ack();
 
             case "TELEMETRIA":
-                if (partes.length >= 4) {
-                    String idWs = partes[1];
-                    String caudal = partes[2];
-                    String volumen = partes[3];
-                    Dashboard.actualizarTelemetria(idWs, caudal, volumen);
-                    return String.valueOf(ACK);
-                }
-                break;
-
-            case "AVERIA":
-                if (partes.length >= 2) {
-                    String idWs = partes[1];
-                    Dashboard.log("¡ALERTA! Avería/Fuga detectada en WS [" + idWs + "].");
-                    
-                    String estadoActual = DatabaseManager.obtenerEstado(idWs);
-                    if ("REGANDO".equals(estadoActual)) {
-                        String idOp = Dashboard.getOperario(idWs);
-                        if (idOp != null && !"-".equals(idOp)) {
-                            WM_Central_Thread hiloOp = conexiones.get(idOp);
-                            if (hiloOp != null) {
-                                hiloOp.enviarTextoOperario("ABORTADO: Fuga detectada en estación [" + idWs + "].");
-                            }
-                        }
-                        KafkaManager.publicarEvento("ABORTO_RIEGO", idWs);
-                    }
-
-                    DatabaseManager.actualizarEstado(idWs, "FUGA");
-                    Dashboard.actualizarEstado(idWs, Dashboard.Estado.FUGA);
-                    return String.valueOf(ACK);
-                }
-                break;
-
-            case "RESUELTA":
-                if (partes.length >= 2) {
-                    String idWs = partes[1];
-                    Dashboard.log("Avería resuelta en WS [" + idWs + "].");
-                    DatabaseManager.actualizarEstado(idWs, "DISPONIBLE");
-                    Dashboard.actualizarEstado(idWs, Dashboard.Estado.DISPONIBLE);
-                    return String.valueOf(ACK);
-                }
-                break;
+                if (tipo != Tipo.ESTACION || partes.length < 4) return nack("NO_REGISTRADO");
+                GestorRiegos.telemetria(idConexion, partes[2], partes[3]);
+                return ack();
 
             case "FIN_RIEGO":
-                if (partes.length >= 4) {
-                    String idWs = partes[1];
-                    String volumenTotal = partes[2];
-                    String duracion = partes[3];
-                    
-                    String resumen = String.format("Volumen Consumido: %s L | Tiempo: %s s", volumenTotal, duracion);
-                    Dashboard.log("Riego Finalizado en WS [" + idWs + "]. " + resumen);
-                    
-                    String idOp = Dashboard.getOperario(idWs);
-                    DatabaseManager.actualizarEstado(idWs, "DISPONIBLE");
-                    Dashboard.actualizarEstado(idWs, Dashboard.Estado.DISPONIBLE);
+                if (tipo != Tipo.ESTACION || partes.length < 4) return nack("NO_REGISTRADO");
+                GestorRiegos.finRiego(idConexion, partes[2], partes[3]);
+                return ack();
 
-                    KafkaManager.publicarEvento("FIN_RIEGO", idWs + "#" + volumenTotal + "#" + duracion);
+            case "AVERIA":
+                if (tipo != Tipo.ESTACION) return nack("NO_REGISTRADO");
+                GestorRiegos.averia(idConexion);
+                return ack();
 
-                    if (!"-".equals(idOp)) {
-                        WM_Central_Thread hiloOp = conexiones.get(idOp);
-                        if (hiloOp != null) {
-                            hiloOp.enviarTextoOperario("RESUMEN_FIN_RIEGO: " + resumen);
-                        }
-                    }
-                    return String.valueOf(ACK);
+            case "RESUELTA":
+                if (tipo != Tipo.ESTACION) return nack("NO_REGISTRADO");
+                GestorRiegos.averiaResuelta(idConexion);
+                return ack();
+
+            case "SOLICITUD_MANUAL": // Riego pedido desde el menú de la propia estación
+                if (tipo != Tipo.ESTACION) return nack("NO_REGISTRADO");
+                GestorRiegos.solicitarRiego(idConexion, GestorRiegos.OPERARIO_LOCAL,
+                        partes.length >= 3 ? parseEntero(partes[2], 0) : 0);
+                return ack();
+
+            // ---------------- Mensajes de los OPERARIOS (WM_FO)
+            case "REGISTRO_OPERARIO": {
+                if (partes.length < 2 || tipo == Tipo.ESTACION) return nack("FORMATO");
+                String idOp = partes[1].trim();
+                String error = GestorRiegos.registrarOperario(idOp, this);
+                if (error != null) return nack(error);
+                this.tipo = Tipo.OPERARIO;
+                this.idConexion = idOp;
+                return ack();
+            }
+            case "ACTIVAR":
+                if (tipo != Tipo.OPERARIO || partes.length < 2) {
+                    enviarTexto("ERROR: Debe registrarse como operario antes de solicitar un riego.");
+                    return null;
                 }
-                break;
+                // El operario siempre es el de la sesión (no se puede pedir en nombre de otro)
+                GestorRiegos.solicitarRiego(partes[1].trim(), idConexion,
+                        partes.length >= 4 ? parseEntero(partes[3], 0) : 0);
+                return null;
 
             case "LISTAR_WS":
-                String listado = Dashboard.obtenerListadoEstaciones();
-                enviarTextoOperario("LISTA_ESTACIONES:" + listado);
+                enviarTexto("LISTA_ESTACIONES:" + Dashboard.obtenerListadoEstaciones());
                 return null;
         }
-        
-        return String.valueOf(NACK);
+
+        return nack("OPERACION_DESCONOCIDA");
     }
 
-    private void manejarDesconexionOCaida() {
-        if (this.idConexion != null) {
-            conexiones.remove(this.idConexion);
-            Dashboard.log("Caída/Timeout detectado en socket: " + this.idConexion);
-            
-            if (!this.idConexion.startsWith("OP_") && !this.idConexion.startsWith("FO_")) {
-                String estadoAnterior = DatabaseManager.obtenerEstado(this.idConexion);
-                
-                // Estrategia 3: Aborto en Central si estaba regando
-                if ("REGANDO".equals(estadoAnterior)) {
-                    Dashboard.log("ABORTADO: La estación [" + this.idConexion + "] perdió conexión durante el riego.");
-                    
-                    String operarioAsignado = Dashboard.getOperario(this.idConexion);
-                    if (operarioAsignado != null && !"-".equals(operarioAsignado)) {
-                        WM_Central_Thread hiloOp = conexiones.get(operarioAsignado);
-                        if (hiloOp != null) {
-                            hiloOp.enviarTextoOperario("ABORTADO: La estación [" + this.idConexion + "] ha perdido la conexión durante el riego");
-                        }
-                    }
-                    
-                    // Publicar en Kafka para trazabilidad
-                    KafkaManager.publicarEvento("ABORTO_RIEGO", this.idConexion);
-                }
-
-                // Estrategia 2: Marcar como DESCONECTADA
-                DatabaseManager.actualizarEstado(this.idConexion, "DESCONECTADA");
-                Dashboard.actualizarEstado(this.idConexion, Dashboard.Estado.DESCONECTADA);
-            }
-        }
-    }
+    // ---------------------------------------------------------------- BUCLE
 
     @Override
     public void run() {
         try {
-            // Estrategia 2: Timeout de 15s para detectar caídas/inactividad
-            skCliente.setSoTimeout(15000);
-            
-            boolean conectado = true;
-            while (conectado) {
-                try {
-                    String cadena = this.leeSocket(skCliente);
-                    if (cadena == null) {
-                        conectado = false;
-                        continue;
-                    }
+            entrada = new DataInputStream(skCliente.getInputStream());
+            salida = new DataOutputStream(skCliente.getOutputStream());
+            // Estrategia 2: timeout de lectura para detectar caídas e inactividad
+            skCliente.setSoTimeout(TIMEOUT_LECTURA_MS);
 
-                    String data = procesarTrama(cadena);
-                    String respuesta = (data != null) ? ejecutarOperacion(data) : String.valueOf(NACK);
+            while (true) {
+                String cadena = entrada.readUTF();
+                ultimaActividadMs = System.currentTimeMillis();
 
-                    if (respuesta != null) {
-                        this.escribeSocket(skCliente, respuesta);
-                    }
-                } catch (SocketTimeoutException te) {
-                    System.err.println("[CENTRAL] Timeout 15s expirado en socket: " + idConexion);
-                    conectado = false;
-                } catch (EOFException eofe) {
-                    conectado = false;
+                String data = procesarTrama(cadena);
+                String respuesta = (data != null) ? ejecutarOperacion(data) : nack("TRAMA_INVALIDA");
+                if (respuesta != null) {
+                    escribeSocket(respuesta);
                 }
             }
+        } catch (SocketTimeoutException te) {
+            System.err.println("[CENTRAL] Timeout de " + (TIMEOUT_LECTURA_MS / 1000) + " s sin actividad en [" + idConexion + "].");
+        } catch (EOFException eofe) {
+            System.out.println("[CENTRAL] Conexión cerrada por el cliente [" + idConexion + "].");
         } catch (Exception e) {
-            System.err.println("[CENTRAL] Excepción en hilo de cliente: " + e.getMessage());
+            System.err.println("[CENTRAL] Conexión perdida con [" + idConexion + "]: " + e.getMessage());
         } finally {
-            manejarDesconexionOCaida();
-            try {
-                if (skCliente != null && !skCliente.isClosed()) skCliente.close();
-            } catch (Exception ignored) {}
+            if (tipo == Tipo.ESTACION) {
+                GestorRiegos.estacionDesconectada(idConexion, this);
+            } else if (tipo == Tipo.OPERARIO) {
+                GestorRiegos.operarioDesconectado(idConexion, this);
+            }
+            cerrar();
         }
     }
 }

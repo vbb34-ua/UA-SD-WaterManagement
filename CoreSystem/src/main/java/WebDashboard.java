@@ -62,51 +62,42 @@ server.createContext("/", exchange -> {
                 String response = "OK";
                 
                 if (query != null) {
-                    String[] params = query.split("&");
                     String ws = null;
                     String action = null;
-                    
-                    for (String param : params) {
+                    int duracion = GestorRiegos.DURACION_DEFECTO_S;
+
+                    for (String param : query.split("&")) {
                         String[] pair = param.split("=");
                         if (pair.length == 2) {
-                            if (pair[0].equals("ws")) ws = pair[1];
-                            if (pair[0].equals("action")) action = pair[1];
+                            String valor = java.net.URLDecoder.decode(pair[1], java.nio.charset.StandardCharsets.UTF_8);
+                            if (pair[0].equals("ws")) ws = valor;
+                            if (pair[0].equals("action")) action = valor;
+                            if (pair[0].equals("dur")) {
+                                try { duracion = Integer.parseInt(valor); } catch (NumberFormatException ignored) {}
+                            }
                         }
                     }
-                    
+
+                    // Punto 11: órdenes a UNA estación (ws=<id>) o a TODAS (ws=ALL)
                     if (ws != null && action != null) {
-                        WM_Central_Thread hiloWS = WM_Central_Thread.conexiones.get(ws);
-                        
+                        boolean todas = "ALL".equals(ws);
                         switch (action) {
                             case "START" -> {
-                                // 6.1: Iniciar riego desde Central
-                                String estadoWS = DatabaseManager.obtenerEstado(ws);
-                                if ("DISPONIBLE".equals(estadoWS)) {
-                                    Dashboard.log("CENTRAL solicita iniciar riego en [" + ws + "].");
-                                    if (hiloWS != null) {
-                                        hiloWS.enviarTrama("SOLICITUD_RIEGO#CENTRAL");
-                                    }
-                                } else {
-                                    Dashboard.log("CENTRAL intentó regar en [" + ws + "] pero está en estado " + estadoWS);
-                                    response = "DENEGADO";
-                                }
+                                if (todas) GestorRiegos.iniciarTodas(duracion);
+                                else GestorRiegos.iniciarDesdeCentral(ws, duracion);
                             }
                             case "BLOCK" -> {
-                                // 6.2: Bloquear WS y detener riegos
-                                Dashboard.log("CENTRAL bloquea la estación [" + ws + "].");
-                                DatabaseManager.actualizarEstado(ws, "FUERA_SERVICIO");
-                                Dashboard.actualizarEstado(ws, Dashboard.Estado.FUERA_SERVICIO);
-                                if (hiloWS != null) {
-                                    hiloWS.enviarTrama("ABORTAR_RIEGO#CENTRAL"); // La WS debe abortar
-                                }
+                                if (todas) GestorRiegos.bloquearTodas();
+                                else GestorRiegos.bloquear(ws);
                             }
                             case "ACTIVATE" -> {
-                                // 6.3: Activar WS (devolver a Disponible)
-                                Dashboard.log("CENTRAL reactiva la estación [" + ws + "].");
-                                DatabaseManager.actualizarEstado(ws, "DISPONIBLE");
-                                Dashboard.actualizarEstado(ws, Dashboard.Estado.DISPONIBLE);
+                                if (todas) GestorRiegos.activarTodas();
+                                else GestorRiegos.activar(ws);
                             }
+                            default -> response = "ACCION_DESCONOCIDA";
                         }
+                    } else {
+                        response = "PARAMETROS_INCOMPLETOS";
                     }
                 }
                 
