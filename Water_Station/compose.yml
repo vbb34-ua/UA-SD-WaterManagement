@@ -8,9 +8,10 @@
 # PC LAB 1 (operarios):   docker compose up -d fo1 fo2
 # Para interactuar con un módulo (menú):  docker attach <contenedor>   (salir sin pararlo: Ctrl+P, Ctrl+Q)
 
+# Sin "image:" fijo: si todos los servicios comparten nombre de imagen, el build en paralelo
+# falla con "image already exists". Cada uno etiqueta la suya, pero reutilizan las mismas capas.
 x-lab: &lab
   build: .
-  image: wm-lab
   stdin_open: true
   tty: true
   restart: unless-stopped
